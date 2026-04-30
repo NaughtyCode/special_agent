@@ -343,7 +343,8 @@ class AgentTool(BaseTool):
 | `list_files` | 列出目录文件 | `directory: str = ".", pattern: str = "*", recursive: bool = False` | 低 |
 | `web_fetch` | 获取网页内容 | `url: str, max_size: int | None` | 中 |
 | `web_search` | 网页搜索 | `query: str, max_results: int = 5` | 中 |
-| `launch_<agent>` | 拉起特化 Agent (由 AgentRegistry 动态生成) | `task: str, context: dict | None` | 取决于子 Agent |
+| `launch_<agent>` | 拉起单个特化 Agent (由 AgentRegistry 动态生成) | `task: str, context: dict | None` | 取决于子 Agent |
+| `launch_crew` | 组建并执行 Agent 团队完成复杂使命 | `mission: str, strategy: str = "sequential", max_parallel: int | None` | 取决于成员 Agent |
 
 ## 8. Tool 安全机制
 
@@ -368,4 +369,264 @@ class ToolSecurityPolicy:
     confirm_on_dangerous: bool          # 危险操作是否需确认 (默认 True)
     confirm_on_write: bool              # 写文件是否需确认
     confirm_on_shell: bool              # Shell 是否需确认
+```
+
+## 9. CrewOrchestrator — 团队编排机制
+
+### 9.1 概述
+
+`CrewOrchestrator` 是 Agent 框架的核心机制之一，使任何特化 Agent 都能成为 **CrewLeader** (团队领导)，根据复杂任务动态组建并领导一组特化 Agent (称为 **Crew**) 协同完成任务。
+
+与 `AgentTool` (单 Agent 拉起) 的关键区别：
+
+| 维度 | AgentTool (§6) | CrewOrchestrator (§9) |
+|------|---------------|----------------------|
+| 拉起数量 | 单个 Agent | 一组 Agent (Crew) |
+| 任务粒度 | 一个完整任务 | 自动分解为多个子任务 |
+| Agent 匹配 | 调用方指定名称 | 自动按子任务匹配最佳 Agent |
+| 执行策略 | 单一: 同步调用 | 多种: 串行 / 并行 / DAG |
+| 结果处理 | 返回原始结果 | 自动汇总聚合 |
+| 适用场景 | 简单委托 | 复杂多面任务 |
+
+### 9.2 核心类设计
+
+```python
+# ── 数据模型 ──────────────────────────────────────
+
+@dataclass
+class SubTask:
+    """
+    由 CrewOrchestrator 分解出的子任务。
+
+    每个子任务描述一个独立的、可分配给特定 Agent 的工作单元。
+    """
+    task_id: str                        # 子任务唯一标识 (UUID)
+    description: str                    # 子任务描述 (Agent 据此理解工作内容)
+    required_tags: list[str]            # 所需 Agent 能力标签 (用于匹配)
+    dependencies: list[str]             # 依赖的 task_id 列表 (DAG 模式)
+    context: dict | None = None         # 传递的上下文数据
+
+@dataclass
+class CrewMember:
+    """
+    Crew 成员 — 一个 Agent 绑定到一个子任务。
+
+    由 CrewOrchestrator 在 plan_crew 阶段创建，
+    在 execute_crew 阶段由 AgentPool 获取实例后填充 agent_instance。
+    """
+    agent_name: str                     # 匹配到的 Agent 名称
+    agent_cls: type[BaseAgent] | None = None  # Agent 类引用 (用于延迟实例化)
+    agent_instance: BaseAgent | None = None   # Agent 实例 (执行时填充)
+    task: SubTask | None = None         # 分配的子任务
+    status: str = "PENDING"             # PENDING → RUNNING → DONE / FAILED
+    result: AgentResult | None = None   # 执行结果
+
+@dataclass
+class AgentCrew:
+    """
+    由 CrewLeader 组件的一支 Agent 团队。
+
+    包含团队标识、任务描述 (mission)、成员列表与执行状态。
+    """
+    crew_id: str                        # Crew 唯一标识 (UUID)
+    lead_agent_name: str                # CrewLeader (发起方 Agent) 名称
+    mission: str                        # 团队使命 (原始任务描述)
+    members: list[CrewMember]           # 团队成员列表
+    status: str = "ASSEMBLED"           # ASSEMBLED → RUNNING → COMPLETED / FAILED
+    created_at: float = 0.0             # 创建时间戳
+
+@dataclass
+class CrewResult:
+    """
+    Crew 执行结果 — 汇总所有成员结果。
+
+    除聚合结果外, 保留每个成员的完整 AgentResult 用于调试和审计。
+    """
+    success: bool                       # 整体是否成功 (全部子任务成功 = True)
+    crew_id: str                        # 来源 Crew 的 ID
+    mission_summary: str                # LLM 汇总的团队使命报告
+    member_results: list[tuple[str, AgentResult]]  # (agent_name, result) 列表
+    execution_order: list[str]          # 子任务执行顺序 (task_id 列表)
+    total_duration_ms: float            # 总耗时 (毫秒)
+    token_usage: TokenUsage             # 团队总 Token 用量
+
+# ── 执行策略枚举 ──────────────────────────────────
+
+class ExecutionStrategy(Enum):
+    """
+    Crew 执行策略 — 决定子任务以何种顺序执行。
+
+    SEQUENTIAL: 按 plan 返回顺序依次执行, 前一个完成后才开始下一个
+    PARALLEL:   并发执行所有无依赖关系的子任务 (最大并发数可配置)
+    DAG:        按依赖关系拓扑排序后执行, 无依赖的可并行
+    """
+    SEQUENTIAL = "sequential"
+    PARALLEL = "parallel"
+    DAG = "dag"
+
+# ── CrewOrchestrator ──────────────────────────────
+
+class CrewOrchestrator:
+    """
+    Crew Orchestrator — 团队编排引擎。
+
+    核心职责:
+    1. 任务分解 (Plan):  将复杂使命分解为 SubTask 列表 (使用 LLM)
+    2. Agent 匹配 (Match): 为每个 SubTask 匹配最合适的特化 Agent (通过 AgentRegistry)
+    3. Crew 组建 (Assemble): 构建 AgentCrew 结构
+    4. Crew 执行 (Execute): 按指定策略驱动各成员执行子任务
+    5. 结果聚合 (Aggregate): 汇总所有成员结果, 生成统一的 CrewResult
+
+    这是框架的核心扩展机制 — 任何特化 Agent 均可通过 CrewOrchestrator
+    将复杂任务拆解并分派给一组更专业的 Agent 协同完成。
+    """
+
+    # ── 依赖 ─────────────────────────────────────────
+    agent_registry: AgentRegistry       # Agent 注册中心 (用于匹配 Agent)
+    agent_pool: AgentPool               # Agent 实例池 (用于获取实例)
+    llm_client: LLMClient               # LLM 客户端 (用于任务分解和结果聚合)
+    event_bus: EventBus                 # 事件总线 (发布 Crew 生命周期事件)
+
+    # ── 配置 ─────────────────────────────────────────
+    max_parallel: int                   # 最大并行成员数 (默认 4)
+    crew_max_iterations: int            # Crew 级任务分解最大迭代 (默认 3)
+    plan_temperature: float             # 任务分解时的 LLM 温度 (默认 0.4)
+
+    # ── 构造 ─────────────────────────────────────────
+    def __init__(self, agent_registry: AgentRegistry,
+                 agent_pool: AgentPool,
+                 llm_client: LLMClient,
+                 event_bus: EventBus,
+                 config: Config) -> None:
+        """
+        初始化 CrewOrchestrator。
+        - 绑定 AgentRegistry / AgentPool / LLMClient / EventBus
+        - 从 Config 读取 max_parallel / crew_max_iterations / plan_temperature
+        """
+
+    # ── Plan: 任务分解与 Agent 匹配 ───────────────────
+    def plan_crew(self, mission: str,
+                  lead_agent_name: str,
+                  available_agents: list[AgentMeta] | None = None
+                  ) -> AgentCrew:
+        """
+        将 mission 分解为 SubTask 列表, 并为每个子任务匹配最佳 Agent。
+
+        内部流程:
+        1. 构建分解 Prompt (含可用 Agent 列表与能力描述)
+        2. LLM 分析 mission, 输出结构化子任务列表 (JSON)
+        3. 每个子任务通过 AgentRegistry.match_agent() 匹配最佳 Agent
+        4. 构建 AgentCrew (含 CrewMember 列表)
+        5. 发布 CrewLifecycleEvent.PLANNED
+
+        返回已组建但尚未执行的 AgentCrew (status=ASSEMBLED)。
+        """
+
+    # ── Execute: Crew 执行 ────────────────────────────
+    def execute_crew(self, crew: AgentCrew,
+                     strategy: ExecutionStrategy = ExecutionStrategy.SEQUENTIAL,
+                     max_parallel: int | None = None
+                     ) -> CrewResult:
+        """
+        按指定策略执行 Crew。
+
+        内部流程:
+        1. 发布 CrewLifecycleEvent.STARTED
+        2. 根据 strategy 分发到 _execute_sequential / _execute_parallel / _execute_dag
+        3. 每个成员执行: AgentPool.acquire → agent.run(task) → AgentPool.release
+        4. 汇总所有成员结果 → 调用 _aggregate_results
+        5. 发布 CrewLifecycleEvent.COMPLETED (或 FAILED)
+        6. 返回 CrewResult
+        """
+
+    def _execute_sequential(self, crew: AgentCrew) -> list[tuple[str, AgentResult]]:
+        """
+        串行执行 — 按 members 列表顺序依次执行每个成员。
+        前一成员的结果 (final_answer) 作为后一成员的 context 传入。
+        适用于有强顺序依赖的任务链。
+        """
+
+    def _execute_parallel(self, crew: AgentCrew,
+                          max_parallel: int) -> list[tuple[str, AgentResult]]:
+        """
+        并行执行 — 并发执行所有成员 (受 max_parallel 限制)。
+        使用 concurrent.futures.ThreadPoolExecutor 实现。
+        适用于成员间无依赖的独立子任务。
+        """
+
+    def _execute_dag(self, crew: AgentCrew) -> list[tuple[str, AgentResult]]:
+        """
+        DAG 执行 — 按依赖关系拓扑排序, 无依赖的成员可并行。
+        每完成一个成员, 检查并释放依赖它的后续成员。
+        """
+
+    # ── Aggregate: 结果聚合 ───────────────────────────
+    def _aggregate_results(self, crew: AgentCrew,
+                           results: list[tuple[str, AgentResult]]) -> CrewResult:
+        """
+        汇总所有成员结果:
+        1. 将所有 member final_answer 拼接为上下文
+        2. 调用 LLM 生成统一的 mission_summary
+        3. 计算 total_duration_ms 和 total token_usage
+        4. 判定整体 success (全部成员 success=True)
+        """
+```
+
+### 9.3 Crew 事件类型
+
+```python
+class CrewLifecycleEvent:
+    """
+    Crew 生命周期事件 — 发布到 EventBus, 供监控/日志/审计订阅。
+
+    枚举值:
+    - PLANNED:   plan_crew() 完成, crew 已组建
+    - STARTED:   execute_crew() 开始
+    - MEMBER_STARTED:  单个 CrewMember 开始执行
+    - MEMBER_COMPLETED: 单个 CrewMember 执行完成
+    - MEMBER_FAILED:    单个 CrewMember 执行失败
+    - COMPLETED: 全部成员执行完毕且成功
+    - FAILED:    存在成员失败且不可恢复
+    """
+```
+
+### 9.4 Crew 编排流程
+
+```
+CrewLeader (任意特化 Agent)
+   │
+   ├─ 1. 识别到任务需要多 Agent 协同
+   │     (LLM 在 ReAct 循环中判断任务复杂度)
+   │
+   ├─ 2. 调用 self.form_crew(mission)
+   │     └─ crew_orchestrator.plan_crew(mission, lead_agent_name, available_agents)
+   │           ├─ LLM 分解 mission → SubTask[]
+   │           ├─ AgentRegistry.match_agent() × N → CrewMember[]
+   │           └─ 返回 AgentCrew (status=ASSEMBLED)
+   │
+   ├─ 3. 调用 self.launch_crew(mission, strategy)
+   │     └─ crew_orchestrator.execute_crew(crew, strategy)
+   │           ├─ SEQUENTIAL: [CodeAgent] → [DocAgent] → [ShellAgent]
+   │           ├─ PARALLEL:   [CodeAgent | DocAgent | SearchAgent] (并发)
+   │           └─ DAG:        [SearchAgent] → [CodeAgent] → [ShellAgent]
+   │                                  └──────────────→ [DocAgent]
+   │
+   ├─ 4. 聚合结果
+   │     └─ LLM 汇总所有 member.final_answer → mission_summary
+   │
+   ▼
+CrewLeader 将 CrewResult.mission_summary 作为 Observation 继续 ReAct 推理
+```
+
+### 9.5 与现有机制的关系
+
+```
+BaseAgent (CrewLeader 角色)
+   ├─ react_engine: ReActEngine       # 自身 ReAct 推理
+   ├─ tool_manager: ToolManager       # 调用 Tool (含 AgentTool 单 Agent 拉起)
+   ├─ crew_orchestrator: CrewOrchestrator  # 组建并执行 Agent 团队 (NEW)
+   │     ├─ plan_crew()               # 分解 + 匹配
+   │     └─ execute_crew()            # 执行 + 聚合
+   ├─ agent_registry: AgentRegistry   # 被 CrewOrchestrator 用于匹配 Agent
+   └─ agent_pool: AgentPool           # 被 CrewOrchestrator 用于获取实例
 ```

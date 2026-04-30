@@ -150,6 +150,7 @@ class EventBus:
     - ToolCallEvent: BEFORE_EXECUTE / AFTER_EXECUTE
     - LLMCallEvent: BEFORE_CALL / AFTER_CALL
     - ReActIterationEvent: ITERATION_START / ITERATION_END
+    - CrewLifecycleEvent: PLANNED / STARTED / MEMBER_STARTED / MEMBER_COMPLETED / MEMBER_FAILED / COMPLETED / FAILED
     """
 
     def subscribe(self, event_type: type, handler: Callable) -> None:
@@ -305,6 +306,7 @@ SpecialAgent/
 │   │   ├── context_store.py           # 上下文存储 + 压缩策略
 │   │   ├── agent_registry.py          # Agent 注册中心 + AgentMeta + MatchResult
 │   │   ├── agent_pool.py              # Agent 实例池
+│   │   ├── crew_orchestrator.py       # Crew 团队编排引擎
 │   │   ├── session_manager.py         # 会话管理器
 │   │   └── plugin_loader.py           # Agent 插件加载器
 │   ├── llm/
@@ -326,6 +328,7 @@ SpecialAgent/
 │   │   ├── shell_tools.py             # RunShellTool
 │   │   ├── search_tools.py            # SearchCodeTool
 │   │   ├── web_tools.py               # WebFetchTool, WebSearchTool
+│   │   ├── crew_tool.py               # CrewTool (Crew 编排 → Tool 适配器)
 │   │   └── agent_tool.py              # AgentTool (Agent → Tool 适配器)
 │   ├── strategies/
 │   │   ├── __init__.py
@@ -333,7 +336,7 @@ SpecialAgent/
 │   │   └── compress_strategy.py       # CompressStrategy 接口 + Sliding/Summarize/Hybrid
 │   ├── events/
 │   │   ├── __init__.py
-│   │   ├── events.py                  # 事件类定义 (AgentLifecycleEvent, ToolCallEvent 等)
+│   │   ├── events.py                  # 事件类定义 (AgentLifecycleEvent, ToolCallEvent, CrewLifecycleEvent 等)
 │   │   └── event_bus.py               # EventBus
 │   └── infra/
 │       ├── __init__.py

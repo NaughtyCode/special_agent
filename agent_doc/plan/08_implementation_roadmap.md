@@ -15,7 +15,7 @@
 | 1.7 | 实现 LLMClient Facade | `agent/llm/llm_client.py` | 1.5, 1.6 |
 | 1.8 | 编写 LLM 层单元测试 | `tests/test_llm_client.py` | 1.7 |
 
-### Phase 2: Agent 基类与 ReAct (预估 3-4 天)
+### Phase 2: Agent 基类与 ReAct (预估 4-5 天)
 
 | 序号 | 任务 | 产出 | 依赖 |
 |------|------|------|------|
@@ -25,10 +25,11 @@
 | 2.4 | 实现 ToolManager (含安全策略) | `agent/core/tool_manager.py` | 2.3 |
 | 2.5 | 实现 MatchStrategy 体系 (Exact/Fuzzy/Semantic/Agent) | `agent/strategies/match_strategy.py` | 2.4 |
 | 2.6 | 实现 AgentRegistry + AgentPool | `agent/core/agent_registry.py`, `agent_pool.py` | 无 |
+| 2.6a | 实现 CrewOrchestrator (Plan/Execute/Aggregate + 三种执行策略) | `agent/core/crew_orchestrator.py` | 1.7, 2.6 |
 | 2.7 | 实现 CompressStrategy 体系 (Sliding/Summarize/Hybrid) | `agent/strategies/compress_strategy.py` | 2.1 |
 | 2.8 | 实现 ContextStore (含压缩策略) | `agent/core/context_store.py` | 2.1, 2.7 |
 | 2.9 | 实现 ReActEngine (注入策略 + 终止条件) | `agent/core/react_engine.py` | 1.7, 2.2, 2.4, 2.5, 2.6, 2.8 |
-| 2.10 | 实现 BaseAgent (状态机 + 钩子 + 错误处理) | `agent/core/base_agent.py` | 2.4, 2.6, 2.8, 2.9 |
+| 2.10 | 实现 BaseAgent (状态机 + 钩子 + Crew 编排 + 错误处理) | `agent/core/base_agent.py` | 2.4, 2.6, 2.6a, 2.8, 2.9 |
 | 2.11 | 编写 BaseAgent 单元测试 | `tests/test_base_agent.py` | 2.10 |
 
 ### Phase 3: 内置 Tool (预估 1-2 天)
@@ -39,17 +40,18 @@
 | 3.2 | 实现 ShellTool (含安全确认) | `agent/tools/shell_tools.py` | 2.3 |
 | 3.3 | 实现 SearchTool + WebTools | `agent/tools/search_tools.py`, `web_tools.py` | 2.3 |
 | 3.4 | 实现 AgentTool 适配器 | `agent/tools/agent_tool.py` | 2.3, 2.6 |
-| 3.5 | 编写 Tool 层单元测试 | `tests/test_tool_*.py` | 3.1-3.4 |
+| 3.4a | 实现 CrewTool 适配器 (launch_crew → Tool) | `agent/tools/crew_tool.py` | 2.3, 2.6a |
+| 3.5 | 编写 Tool 层单元测试 (含 CrewTool) | `tests/test_tool_*.py` | 3.1-3.4a |
 
 ### Phase 4: 特化 Agent (预估 2-3 天)
 
 | 序号 | 任务 | 产出 | 依赖 |
 |------|------|------|------|
-| 4.1 | 实现 CodeAgent | `agent/agents/code_agent.py` | 2.10, 3.1-3.3 |
-| 4.2 | 实现 DocAgent | `agent/agents/doc_agent.py` | 2.10, 3.1, 3.3 |
-| 4.3 | 实现 SearchAgent | `agent/agents/search_agent.py` | 2.10, 3.1, 3.3 |
-| 4.4 | 实现 ShellAgent | `agent/agents/shell_agent.py` | 2.10, 3.2 |
-| 4.5 | 编写 Agent 级测试 | `tests/test_agents.py` | 4.1-4.4 |
+| 4.1 | 实现 CodeAgent (含 CrewLeader 角色) | `agent/agents/code_agent.py` | 2.10, 3.1-3.3, 3.4a |
+| 4.2 | 实现 DocAgent (含 CrewLeader 角色) | `agent/agents/doc_agent.py` | 2.10, 3.1, 3.3, 3.4a |
+| 4.3 | 实现 SearchAgent (含 CrewLeader 角色) | `agent/agents/search_agent.py` | 2.10, 3.1, 3.3, 3.4a |
+| 4.4 | 实现 ShellAgent (含 CrewLeader 角色) | `agent/agents/shell_agent.py` | 2.10, 3.2, 3.4a |
+| 4.5 | 编写 Agent 级测试 (含 Crew 编排测试) | `tests/test_agents.py` | 4.1-4.4 |
 
 ### Phase 5: RootAgent 与入口 (预估 2-3 天)
 
@@ -59,7 +61,7 @@
 | 5.2 | 实现 AgentPluginLoader | `agent/core/plugin_loader.py` | 2.10 |
 | 5.3 | 实现 RootAgent (REPL + 三级路由 + 插件) | `agent/agents/root_agent.py` | 2.10, 2.6, 4.1-4.4, 5.1, 5.2 |
 | 5.4 | 实现 main.py 入口 | `agent/main.py` | 5.3 |
-| 5.5 | 编写集成测试 | `tests/test_integration.py` | 5.4 |
+| 5.5 | 编写集成测试 (含 Crew 编排端到端测试) | `tests/test_integration.py` | 5.4 |
 
 ### Phase 6: 文档与发布 (预估 1 天)
 
@@ -68,7 +70,7 @@
 | 6.1 | 编写 README (含快速开始与配置说明) | `README.md` | 5.4 |
 | 6.2 | 编写 requirements.txt | `requirements.txt` | 全 Phase |
 | 6.3 | 编写示例插件 Agent | `plugins/example_agent.py` | 5.2 |
-| 6.4 | 端到端验证与错误场景测试 | 测试报告 | 5.5 |
+| 6.4 | 端到端验证与错误场景测试 (含 Crew 串行/并行/DAG) | 测试报告 | 5.5 |
 
 ## 2. 依赖关系图
 
@@ -89,22 +91,24 @@ Phase 2 (Agent 基类与 ReAct)           │
   ├─ 2.4 ToolManager ← 2.3            │
   ├─ 2.5 MatchStrategy ← 2.4          │
   ├─ 2.6 AgentRegistry + AgentPool    │
+  ├─ 2.6a CrewOrchestrator ← 1.7,2.6  │
   ├─ 2.7 CompressStrategy ← 2.1       │
   ├─ 2.8 ContextStore ← 2.1,2.7      │
   ├─ 2.9 ReActEngine ← 1.7,2.2,2.4,2.5,2.6,2.8
-  └─ 2.10 BaseAgent ← 2.4,2.6,2.8,2.9│
+  └─ 2.10 BaseAgent ← 2.4,2.6,2.6a,2.8,2.9│
                                        │
 Phase 3 (内置 Tool)                    │
   ├─ 3.1 FileTools ← 2.3              │
   ├─ 3.2 ShellTool ← 2.3              │
   ├─ 3.3 SearchTool + WebTools ← 2.3  │
-  └─ 3.4 AgentTool ← 2.3,2.6          │
+  ├─ 3.4 AgentTool ← 2.3,2.6          │
+  └─ 3.4a CrewTool ← 2.3,2.6a         │
                                        │
 Phase 4 (特化 Agent)                   │
-  ├─ 4.1 CodeAgent ← 2.10,3.1-3.3     │
-  ├─ 4.2 DocAgent ← 2.10,3.1,3.3      │
-  ├─ 4.3 SearchAgent ← 2.10,3.1,3.3   │
-  └─ 4.4 ShellAgent ← 2.10,3.2        │
+  ├─ 4.1 CodeAgent ← 2.10,3.1-3.3,3.4a│
+  ├─ 4.2 DocAgent ← 2.10,3.1,3.3,3.4a │
+  ├─ 4.3 SearchAgent ← 2.10,3.1,3.3,3.4a│
+  └─ 4.4 ShellAgent ← 2.10,3.2,3.4a   │
                                        │
 Phase 5 (RootAgent 与入口)             │
   ├─ 5.1 SessionManager ← 2.8         │
@@ -151,3 +155,11 @@ Phase 6 (文档与发布) ← 全 Phase ───────┘
 - 钩子方法: _on_before_react_loop / _on_after_react_loop
 - 插件系统: AgentPluginLoader 动态发现外部 Agent
 - 事件总线: 发布-订阅模式, 便于监控/日志/审计集成
+
+### 3.7 Crew 编排
+- 核心机制 — 任何特化 Agent 均可通过 CrewOrchestrator 成为 CrewLeader
+- 任务分解: LLM 将复杂使命分解为 SubTask 列表
+- Agent 匹配: 每个 SubTask 自动匹配最合适的特化 Agent (通过 AgentRegistry)
+- 三种执行策略: SEQUENTIAL (串行) / PARALLEL (并行) / DAG (依赖拓扑)
+- CrewTool 适配器: 将 launch_crew 暴露为 LLM 可调用的 Tool
+- 结果聚合: LLM 汇总所有成员结果, 生成统一的 mission_summary

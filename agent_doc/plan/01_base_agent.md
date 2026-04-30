@@ -36,6 +36,8 @@ class BaseAgent(ABC):
     # ── Tool ─────────────────────────────────────────
     tool_manager: ToolManager       # Tool 管理器
     agent_registry: AgentRegistry   # Agent 注册中心 (用于拉起子 Agent)
+    agent_pool: AgentPool           # Agent 实例池
+    crew_orchestrator: CrewOrchestrator  # 团队编排引擎 (组建并执行 Agent 团队)
 
     # ── 上下文 ───────────────────────────────────────
     context_store: ContextStore     # 上下文存储 (消息历史)
@@ -81,6 +83,7 @@ class BaseAgent(ABC):
         - 从 Config 和 AgentConfig 合并配置参数
         - 创建 LLMClient (内部根据 Config 选择 Provider)
         - 创建 ReActEngine / ToolManager / ContextStore / EventBus
+        - 创建 AgentPool / AgentRegistry / CrewOrchestrator
         - 调用 self.register_tools() 注册子类特有 Tool
         - 状态初始化为 IDLE, 发布 AgentLifecycleEvent.INITIALIZED
         """
@@ -156,6 +159,37 @@ class BaseAgent(ABC):
         拉起指定名称的特化 Agent 执行子任务。
         自动注入 AgentConfig(call_depth = self.config.call_depth + 1),
         若超出最大深度则抛出 AgentDepthExceededError。
+        """
+
+    # ── Crew 编排 ─────────────────────────────────────
+    def form_crew(self, mission: str) -> AgentCrew:
+        """
+        将复杂使命分解为子任务并组建 Agent 团队。
+
+        调用 crew_orchestrator.plan_crew():
+        1. LLM 分析 mission, 分解为 SubTask 列表
+        2. 每个 SubTask 通过 AgentRegistry 匹配最佳特化 Agent
+        3. 构建并返回 AgentCrew (status=ASSEMBLED)
+
+        返回的 AgentCrew 可调用 launch_crew() 执行,
+        或先检查/手动调整成员再执行。
+        """
+
+    def launch_crew(self, mission: str,
+                    strategy: ExecutionStrategy = ExecutionStrategy.SEQUENTIAL,
+                    max_parallel: int | None = None) -> CrewResult:
+        """
+        组建并执行一个 Agent 团队完成复杂使命 (form_crew + execute_crew)。
+
+        流程:
+        1. 调用 self.form_crew(mission) 组建团队
+        2. 调用 crew_orchestrator.execute_crew(crew, strategy, max_parallel)
+        3. 将 CrewResult.mission_summary 写入 ContextStore
+        4. 发布 CrewLifecycleEvent.COMPLETED / FAILED
+        5. 返回聚合后的 CrewResult
+
+        适用场景: 当 LLM 在 ReAct 循环中判断当前任务需多 Agent 协同时,
+        通过 Function Calling 调用此方法 (暴露为 launch_crew Tool)。
         """
 
     # ── LLM 操作 ──────────────────────────────────────

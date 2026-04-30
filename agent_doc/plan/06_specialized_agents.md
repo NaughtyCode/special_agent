@@ -8,9 +8,10 @@
 
 1. **单一职责**: 每个 Agent 只处理一类任务，职责边界清晰
 2. **最小覆写**: 只需定义 system_prompt + register_tools，ReAct 逻辑由基类统一提供
-3. **可组合**: RootAgent 可将多个特化 Agent 串行/嵌套组合完成复杂任务
-4. **可扩展**: 新增 Agent 只需创建子类并注册，无需修改框架代码
-5. **可配置**: 每个 Agent 可通过 AgentConfig 独立调参 (模型/温度/最大迭代数)
+3. **Crew 协同**: 任何特化 Agent 均可成为 CrewLeader，动态组建并领导一组匹配的 Agent 协同完成复杂任务
+4. **可组合**: RootAgent 可将多个特化 Agent 串行/嵌套组合完成复杂任务
+5. **可扩展**: 新增 Agent 只需创建子类并注册，无需修改框架代码
+6. **可配置**: 每个 Agent 可通过 AgentConfig 独立调参 (模型/温度/最大迭代数)
 
 ## 3. 内置特化 Agent
 
@@ -288,7 +289,85 @@ RootAgent
        汇总比较 → 选择最佳方案
 ```
 
-## 6. Agent 配置最佳实践
+### 5.5 Crew 编排 (Crew Orchestration)
+```
+CodeAgent (CrewLeader)
+   │
+   ├─ 1. 识别: LLM 判断用户需求需多领域协作
+   │    "帮我实现一个 REST API: 需要代码 + 文档 + 搜索参考 + 验证"
+   │
+   ├─ 2. Plan: form_crew(mission)
+   │    ├→ LLM 分解:
+   │    │    SubTask₁: "实现 API 代码"       → CodeAgent
+   │    │    SubTask₂: "搜索最佳实践参考"     → SearchAgent
+   │    │    SubTask₃: "编写 API 文档"       → DocAgent
+   │    │    SubTask₄: "运行测试验证"         → ShellAgent
+   │    └→ 组建 AgentCrew (4 members, status=ASSEMBLED)
+   │
+   ├─ 3. Execute: launch_crew(mission, strategy=DAG)
+   │    ├→ SearchAgent (搜索参考) ──→ CodeAgent (实现代码)
+   │    │                                  ├→ DocAgent (编写文档)
+   │    │                                  └→ ShellAgent (运行测试)
+   │    └→ 发布 CrewLifecycleEvent (每个成员)
+   │
+   ├─ 4. Aggregate: LLM 汇总所有成员结果
+   │    └→ "API 已实现并通过测试, 文档已生成..."
+   │
+   ▼
+返回 CrewResult.mission_summary 给用户
+```
+
+## 7. Crew 使用示例
+
+任何特化 Agent 均可通过继承自 BaseAgent 的 `form_crew()` 和 `launch_crew()` 方法成为 **CrewLeader**，无需额外覆写。
+
+```python
+# 示例: CodeAgent 在 ReAct 循环中拉起 Crew 完成复杂需求
+#
+# 当用户输入 "帮我实现一个用户认证系统" 时,
+# CodeAgent 的 LLM 识别到任务需多领域协作 (代码 + 文档 + 测试),
+# 通过 Function Calling 调用 launch_crew:
+
+# CodeAgent 在 register_tools() 中额外注册
+def register_tools(self) -> None:
+    self.tool_manager.register(ReadFileTool())
+    self.tool_manager.register(WriteFileTool())
+    self.tool_manager.register(SearchCodeTool())
+    self.tool_manager.register(RunShellTool(requires_confirmation=True))
+    self.tool_manager.register(ListFilesTool())
+    # 注册 launch_crew 作为可用 Tool — LLM 可在 ReAct 中调用
+    self.tool_manager.register(CrewTool(agent=self))
+
+# CrewTool 将 launch_crew() 包装为 Tool,
+# 使 LLM 可通过 Function Calling 发起 Crew 编排:
+# {
+#     "name": "launch_crew",
+#     "arguments": {
+#         "mission": "实现用户认证系统: 含登录/注册/密码重置",
+#         "strategy": "dag",
+#         "max_parallel": 4
+#     }
+# }
+
+# 执行结果: CrewResult
+# {
+#     "success": true,
+#     "mission_summary": "已完成用户认证系统实现:
+#         1. CodeAgent 实现了 login/register/reset 三个端点
+#         2. DocAgent 生成了 API 文档 (含参数说明)
+#         3. ShellAgent 运行了 12 个测试用例全部通过
+#         4. SearchAgent 提供了 bcrypt 最佳实践参考",
+#     "member_results": [
+#         ("SearchAgent", AgentResult(...)),
+#         ("CodeAgent", AgentResult(...)),
+#         ("DocAgent", AgentResult(...)),
+#         ("ShellAgent", AgentResult(...))
+#     ],
+#     "token_usage": TokenUsage(prompt_tokens=8500, completion_tokens=3200, total_tokens=11700)
+# }
+```
+
+## 8. Agent 配置最佳实践
 
 | Agent | 推荐 temperature | 推荐 max_iterations | 备注 |
 |-------|-----------------|--------------------|------|
