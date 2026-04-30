@@ -122,6 +122,10 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
 
         engine_.ApplyConfig(config_)
 
+        LOG_DEBUG("Session created: conv={}, engine={}, remote={}",
+                  conv_, EngineTypeToString(config_.engine_type),
+                  remote_addr_.ToString())
+
     DESTRUCTOR ~Session():
         // 取消未完成的shutdown定时器
         IF shutdown_timer_.IsValid():
@@ -129,6 +133,8 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
         // 如启用统计,在析构前将最终快照写入MetricsSink
         IF config_.enable_metrics AND stats_.total_packets_recv > 0:
             FlushStats()
+        LOG_DEBUG("Session destroyed: conv={}, total_sent={}, total_recv={}",
+                  conv_, stats_.total_bytes_sent, stats_.total_bytes_recv)
 
     // 禁止拷贝,允许移动
     Session(const Session&) = delete
@@ -140,11 +146,13 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
 
     FUNCTION Start() -> void:
         IF state_ != kIdle: RETURN
+        LOG_INFO("Session conv={}: started", conv_)
         TransitionState(kConnected)
 
     // 立即关闭: 通知对端 + 清空缓冲区 + 进入终态
     FUNCTION Close() -> void:
         IF state_ == kClosed: RETURN
+        LOG_INFO("Session conv={}: closed (immediate)", conv_)
         CancelShutdownTimer()
         TransitionState(kClosed)
         engine_.NotifyClose()
@@ -153,6 +161,8 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
     // 优雅关闭: 通知对端 → 等待ACK确认 → 超时后强制Close
     FUNCTION GracefulShutdown(timeout_ms: uint32_t = 5000) -> void:
         IF state_ != kConnected: RETURN
+        LOG_INFO("Session conv={}: graceful shutdown initiated, timeout={}ms",
+                 conv_, timeout_ms)
         TransitionState(kClosing)
         engine_.SendShutdownNotification()
         shutdown_timer_ = event_loop_.AddTimer(timeout_ms, [this]():
@@ -167,11 +177,16 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
 
     FUNCTION Send(data: const uint8_t*, len: size_t) -> SendResult:
         IF state_ != kConnected:
+            LOG_WARN("Session conv={}: send blocked (state={})",
+                     conv_, StateToString(state_))
             RETURN SendResult::kBlocked
         result = engine_.Send(data, len)
         IF result == SendResult::kQueued:
             stats_.total_bytes_sent += len
             stats_.total_messages_sent += 1
+        ELSE:
+            LOG_WARN("Session conv={}: send blocked (window_used={})",
+                     conv_, stats_.send_window_used)
         RETURN result
 
     // 发送协议层握手包 (由Client在连接初始化时调用)
@@ -186,6 +201,7 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
 
     FUNCTION FeedInput(data: const uint8_t*, len: size_t) -> void:
         IF state_ == kClosed: RETURN
+        LOG_TRACE("Session conv={}: received {} bytes from network", conv_, len)
         last_recv_time_ms_ = Clock::NowMs()
         stats_.total_packets_recv += 1
         stats_.total_bytes_recv += len
@@ -260,6 +276,8 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
         FUNCTION TransitionState(new_state: SessionState) -> void:
             old = state_
             state_ = new_state
+            LOG_INFO("Session conv={}: {} -> {}",
+                     conv_, StateToString(old), StateToString(new_state))
             IF state_change_callback_:
                 state_change_callback_(old, new_state)
 
@@ -283,6 +301,7 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
                     BREAK
 
         FUNCTION NotifyError(error: SessionError) -> void:
+            LOG_ERROR("Session conv={}: error={}", conv_, ErrorToString(error))
             IF error_callback_: error_callback_(error)
 
         FUNCTION CancelShutdownTimer() -> void:

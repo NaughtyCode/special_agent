@@ -82,6 +82,9 @@ CLASS Client:
             on_success: ConnectSuccessHandler = nullptr,
             on_failure: ConnectFailureHandler = nullptr
     ) -> void:
+        LOG_INFO("Client: connecting to {}:{}",
+                 config_.remote_address.ip, config_.remote_address.port)
+
         // 如果当前有活跃连接,先断开
         IF state_ != ClientState::kDisconnected AND state_ != ClientState::kClosed:
             Disconnect()
@@ -121,6 +124,7 @@ CLASS Client:
         )
 
         // 发送握手首包 (触发服务器的隐式Accept)
+        LOG_DEBUG("Client: created session conv={}, sending handshake", conv_)
         session_->SendHandshakePacket()
 
         // 注意: state_ 保持 kConnecting,不在此处设为 kConnected
@@ -135,6 +139,8 @@ CLASS Client:
             event_loop_.CancelTimer(connect_timer_)
 
         state_ = ClientState::kConnected
+        LOG_INFO("Client: connection established to {}:{}, conv={}",
+                 config_.remote_address.ip, config_.remote_address.port, conv_)
 
         IF success_handler_:
             success_handler_(session_)
@@ -146,6 +152,8 @@ CLASS Client:
 
         IF NOT config_.reconnect.has_value():
             // 无重连策略: 直接通知失败
+            LOG_ERROR("Client: connect failed to {}:{}, timeout",
+                      config_.remote_address.ip, config_.remote_address.port)
             event_loop_.CancelTimer(connect_timer_)
             NotifyConnectFailure(ConnectError::kTimeout)
             RETURN
@@ -153,11 +161,17 @@ CLASS Client:
         // 指数退避重连
         strategy = config_.reconnect.value()
         IF strategy.max_attempts > 0 AND retry_count_ >= strategy.max_attempts:
+            LOG_ERROR("Client: max retries exceeded ({}) to {}:{}",
+                      strategy.max_attempts,
+                      config_.remote_address.ip, config_.remote_address.port)
             event_loop_.CancelTimer(connect_timer_)
             NotifyConnectFailure(ConnectError::kMaxRetriesExceeded)
             RETURN
 
         retry_count_++
+        LOG_WARN("Client: connection timeout to {}:{}, retry {}/{}",
+                 config_.remote_address.ip, config_.remote_address.port,
+                 retry_count_, strategy.max_attempts)
         delay = MIN(
             strategy.initial_delay_ms * POW(strategy.backoff_factor, retry_count_ - 1),
             strategy.max_delay_ms
@@ -183,6 +197,9 @@ CLASS Client:
     FUNCTION Disconnect() -> void:
         IF state_ == ClientState::kDisconnected OR state_ == ClientState::kClosed:
             RETURN
+
+        LOG_INFO("Client: disconnected from {}:{}",
+                 config_.remote_address.ip, config_.remote_address.port)
 
         // 取消连接超时定时器 (生命周期安全: 防止悬空指针回调)
         IF connect_timer_.IsValid():
@@ -278,6 +295,9 @@ CLASS Client:
         )
 
     PRIVATE FUNCTION NotifyConnectFailure(error: ConnectError) -> void:
+        LOG_ERROR("Client: connect failed to {}:{}, error={}",
+                  config_.remote_address.ip, config_.remote_address.port,
+                  ConnectErrorToString(error))
         state_ = ClientState::kDisconnected
         IF session_:
             session_->Close()

@@ -214,6 +214,9 @@ SystemConfig (根)
 | **快照不可变** | `ConfigurationManager::GetConfig()` 返回 `shared_ptr<const>` | 多线程读配置无需锁,原子交换指针 |
 | **分层反序列化** | `ConfigurationManager::DeserializeLibrary/Server/Client/...` | 逐 Section 反序列化,未出现的 key 保留默认值 |
 | **环境注入** | `ApplyEnvOverrides` / `ApplyCmdLineOverrides` | 外部环境注入配置,实现 12-factor app 原则 |
+| **回调注入** | `LogManager::SetLogCallback` | 日志输出回调由外部设置,库不依赖具体日志框架 |
+| **编译期裁剪** | `LOG_COMPILE_MIN_LEVEL` + `LOG_TRACE`/`LOG_DEBUG` 宏 | Release构建中TRACE/DEBUG级别被编译器完全移除,热路径零开销 |
+| **双级过滤** | 编译期宏 + 运行时原子变量 | 编译期裁剪不输出级别,运行时原子读取无锁过滤剩余级别 |
 
 ---
 

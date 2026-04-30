@@ -59,11 +59,18 @@ FUNCTION LibraryInitialize(config_file_path: string = "netlib_config.json"):
     // 步骤3: 获取最终配置快照 (线程安全,不可变)
     config = config_mgr.GetConfig()
 
-    // 步骤4: 根据配置创建IO后端 (自动检测或显式指定)
+    // 步骤4: 初始化日志系统 (根据配置文件中的log_level和log_output)
+    //        log_output可选: "stdout"/"stderr"/"callback"/文件路径
+    //        "callback"模式由应用层通过LogManager::SetLogCallback注册
+    LogManager::SetLevel(ParseLogLevel(config->library.log_level))
+    IF config->library.log_output != "callback":
+        LogManager::SetLogCallback(CreateDefaultLogSink(config->library.log_output))
+
+    // 步骤5: 根据配置创建IO后端 (自动检测或显式指定)
     //        config->library.io_backend: "auto"/"epoll"/"iocp"/"kqueue"/"poll"
     event_loop = EventLoop(ParseIOBackend(config->library.io_backend))
 
-    // 步骤5: 创建WorkerPool (如配置多线程模式)
+    // 步骤6: 创建WorkerPool (如配置多线程模式)
     //        config->worker_pool.num_workers: 0=硬件并发数
     IF config->worker_pool.num_workers > 1 OR config->worker_pool.num_workers == 0:
         worker_pool = WorkerPool(
@@ -71,7 +78,7 @@ FUNCTION LibraryInitialize(config_file_path: string = "netlib_config.json"):
             ParseDispatchStrategy(config->worker_pool.dispatch_strategy)
         )
 
-    // 步骤6: 注册运行时配置重载 (SIGHUP或管理接口触发)
+    // 步骤7: 注册运行时配置重载 (SIGHUP或管理接口触发)
     //        仅修改可热更新的参数 (日志级别/超时阈值等)
     //        io_backend/端口等需重启生效
     SignalHandler::OnSIGHUP([&config_mgr]():
@@ -267,14 +274,15 @@ FUNCTION ConfigureProtocol(session, profile: ProtocolProfile):
 ## 4. 核心模块依赖关系与扩展点
 
 ```
-                    ┌──────────────────┐
-                    │ ConfigurationMgr │ ← 启动时加载JSON配置
-                    │ (系统配置管理器)  │
-                    └────────┬─────────┘
-                             │ 初始化时注入各层配置
-                    ┌────────┴─────────┐
-                    │   Application     │
-                    └────────┬─────────┘
+                    ┌──────────────────┐     ┌──────────────┐
+                    │ ConfigurationMgr │     │  LogManager  │ ← 全局日志管理器
+                    │ (系统配置管理器)  │     │ (日志回调注入) │   应用层注入回调
+                    └────────┬─────────┘     └──────┬───────┘
+                             │                      │ 所有模块输出日志
+                             │ 初始化时注入各层配置   │
+                    ┌────────┴──────────────────────┴─┐
+                    │         Application              │
+                    └────────┬─────────┬───────────────┘
                              │ 仅依赖公开接口
               ┌──────────────┼──────────────┐
               ▼              ▼              ▼
@@ -300,12 +308,14 @@ FUNCTION ConfigureProtocol(session, profile: ProtocolProfile):
 
    关键扩展点:
    0. ConfigurationMgr — 从JSON文件加载全库配置,支持环境变量/命令行覆盖和热重载
+   0.1 LogManager      — 日志输出回调由外部注入,支持编译期级别裁剪和运行时级别过滤
    1. Protocol Engine  — 实现统一接口即可替换为任意可靠传输协议 (内置KCP和QUIC两种实现)
    2. DatagramSocket   — 适配UDPLite/RAW Socket/模拟测试层
    3. TaskQueue        — 可替换为无锁MPSC队列/优先级队列/有界队列
    4. TimerService     — 可替换为高精度定时器/分层时间轮
    5. IOBackend        — 可替换为epoll(Linux/Android)/IOCP(Windows)/kqueue(macOS/BSD/iOS)/poll(回退)
    6. JSON Parser      — 可替换为nlohmann/json / simdjson / rapidjson (配置解析层)
+   7. LogSink          — 可替换日志输出目标 (stdout/stderr/文件/远程syslog/自定义回调)
 ```
 
 ## 5. 线程模型 (多策略可配置)

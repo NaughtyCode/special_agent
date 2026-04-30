@@ -859,7 +859,138 @@ void FireExpired(uint64_t now_ms)
 
 ---
 
-## 10. 基础类型与工具
+## 10. LogManager 类
+
+```
+类名: LogManager
+头文件: log_manager.h
+描述: 全局日志管理器,提供线程安全的日志回调注册和分级输出
+     支持编译期级别裁剪和运行时级别过滤
+     所有静态方法线程安全,是库的Public API
+```
+
+### 10.1 日志级别
+
+```
+enum class LogManager::Level : uint8_t {
+    kTrace = 0,  // 追踪级 (最详细,仅开发调试,Release构建默认裁剪)
+    kDebug = 1,  // 调试级 (开发环境)
+    kInfo  = 2,  // 信息级 (生产环境默认,记录关键业务事件)
+    kWarn  = 3,  // 警告级 (非预期但可恢复的情况)
+    kError = 4,  // 错误级 (操作失败,需关注)
+    kFatal = 5   // 致命级 (不可恢复,通常随后退出进程)
+};
+```
+
+### 10.2 回调类型
+
+```
+using LogManager::LogCallback = std::move_only_function<void(
+    Level level,              // 日志级别
+    const char* file,         // 源文件名 (__FILE__)
+    int line,                 // 行号 (__LINE__)
+    const char* function,     // 函数名 (__FUNCTION__ / __func__)
+    const std::string& message // 格式化后的日志消息
+)>;
+// 线程安全要求: 回调可能从多个线程并发调用,
+//             LogManager内部已对回调调用加锁,
+//             回调实现无需自行处理同步
+```
+
+### 10.3 Public API
+
+```
+static void SetLogCallback(LogCallback cb)
+// 参数: cb — [in] 日志回调函数,传入nullptr则禁用日志输出
+// 说明: 线程安全,可从任何线程调用
+//       重复调用会替换之前注册的回调
+//       回调在LogManager内部锁保护下被调用,回调实现无需自行加锁
+// 注意: 回调中不应:
+//         a. 再次调用SetLogCallback (会导致死锁)
+//         b. 执行长时间阻塞操作 (会阻塞所有日志输出)
+//         c. 抛出异常 (会被捕获并忽略,但日志消息丢失)
+
+static LogCallback* GetLogCallback()
+// 返回值: 当前注册的回调指针,nullptr表示未设置
+// 说明: 仅供检查回调是否已设置,调用方不应持有过久
+
+static void SetLevel(Level level)
+// 参数: level — [in] 最低输出级别,默认kInfo
+// 说明: 低于此级别的日志消息被丢弃
+//       线程安全: 可从任何线程调用,原子操作
+
+static Level GetLevel()
+// 返回值: 当前运行时日志级别
+// 说明: 原子读取,可从任何线程调用
+
+static bool IsLevelEnabled(Level level)
+// 返回值: true=该级别日志将被输出
+// 说明: 用于调用方在构造日志消息前进行快速检查,避免不必要的格式化开销
+```
+
+### 10.4 内部日志输出
+
+```
+static void Log(
+    Level level,
+    const char* file,
+    int line,
+    const char* function,
+    const char* fmt,
+    ...   // printf风格变参 → 内部格式化为std::string
+)
+// 说明: 通常不直接调用,由LOG_*宏封装
+//       线程安全: 内部对回调访问加锁
+//       流程: 运行时级别过滤(无锁原子读取) → 格式化消息(锁外) → 调用回调(持锁)
+//       如果级别为kFatal,可选触发用户注册的fatal handler
+```
+
+### 10.5 日志宏 (编译期裁剪)
+
+```cpp
+// 编译期最低日志级别 (CMake/构建系统可覆盖)
+#ifndef LOG_COMPILE_MIN_LEVEL
+    #ifdef NDEBUG
+        #define LOG_COMPILE_MIN_LEVEL  LogManager::Level::kInfo   // Release: 裁剪TRACE/DEBUG
+    #else
+        #define LOG_COMPILE_MIN_LEVEL  LogManager::Level::kTrace  // Debug: 保留全部
+    #endif
+#endif
+
+#define LOG_TRACE(fmt, ...)  // 追踪级 (Release中编译器完全移除,零运行时开销)
+#define LOG_DEBUG(fmt, ...)  // 调试级 (Release中编译器完全移除)
+#define LOG_INFO(fmt, ...)   // 信息级 (生产环境默认输出)
+#define LOG_WARN(fmt, ...)   // 警告级
+#define LOG_ERROR(fmt, ...)  // 错误级
+#define LOG_FATAL(fmt, ...)  // 致命级
+// 所有宏自动注入 __FILE__, __LINE__, __FUNCTION__
+// 编译期级别检查: 低于LOG_COMPILE_MIN_LEVEL的宏调用被编译器完全消除
+```
+
+### 10.6 使用示例
+
+```cpp
+// 注册回调 (应用层在库初始化阶段调用)
+LogManager::SetLogCallback([](LogManager::Level level,
+                               const char* file, int line,
+                               const char* func,
+                               const std::string& msg) {
+    fprintf(stderr, "[%d] [%s] %s:%d %s\n",
+            static_cast<int>(level), func, file, line, msg.c_str());
+});
+
+// 设置运行时级别
+LogManager::SetLevel(LogManager::Level::kDebug);
+
+// 使用日志宏
+LOG_INFO("Network library initialized, backend={}", io_backend_name);
+LOG_DEBUG("Session {}: send_window={}", conv, send_window);
+LOG_ERROR("Session {}: error={}", conv, ErrorToString(error));
+```
+
+---
+
+## 11. 基础类型与工具
 
 ```
 // 时钟
@@ -888,7 +1019,10 @@ struct SessionStats {
 struct LibraryConfig {
     IOBackend io_backend = IOBackend::kAutoDetect;  // IO后端选择
     bool enable_metrics = true;                      // 是否启用全局指标收集
-    // ... 预留: 日志级别、内存分配器、断言处理器等
+    std::string log_level = "info";                  // 运行时日志级别 ("trace"/"debug"/"info"/"warn"/"error")
+    std::string log_output = "stdout";               // 日志输出目标 ("stdout"/"stderr"/"callback"/文件路径)
+    std::string metrics_output;                      // 指标输出目标 (空=不输出)
+    int max_worker_threads = 0;                      // 最大工作线程数 (0=硬件并发数)
 };
 
 // Message — 从传输层完整接收的用户消息
@@ -909,7 +1043,7 @@ public:
 
 ---
 
-## 11. ProtocolEngine 接口 (扩展点参考)
+## 12. ProtocolEngine 接口 (扩展点参考)
 
 ```
 // ============================================================

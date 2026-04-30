@@ -80,6 +80,9 @@ CLASS Server:
         IF state_ == ServerState::kRunning: RETURN
         state_ = ServerState::kRunning
 
+        LOG_INFO("Server started: listening on {}:{}",
+                 config_.listen_address.ip, config_.listen_address.port)
+
         // 注册Socket可读事件: 数据报到达时回调 OnReadable()
         socket_.SetReadHandler(this)
 
@@ -92,6 +95,9 @@ CLASS Server:
     FUNCTION Stop() -> void:
         IF state_ == ServerState::kStopped: RETURN
         state_ = ServerState::kStopped
+
+        LOG_INFO("Server stopped: {} sessions active at shutdown",
+                 sessions_.size())
 
         // 取消健康检测定时器 (生命周期安全: 在清理会话前取消)
         event_loop_.CancelTimer(health_timer_)
@@ -159,6 +165,11 @@ CLASS Server:
 
                 sessions_[routing_key.value()] = session
 
+                LOG_INFO("Server: new session accepted, conv={}, from={}",
+                         routing_key.value(), result.sender.ToString())
+                LOG_DEBUG("Server: session count now {}/{}",
+                          sessions_.size(), config_.max_sessions)
+
                 IF new_session_handler_:
                     new_session_handler_(session)
 
@@ -186,6 +197,7 @@ CLASS Server:
         now = Clock::NowMs()
         stale_conv_list = std::vector<uint32_t>()   // 收集过期会话ID,批量处理
 
+        idle_count = 0
         FOR EACH (conv, session) IN sessions_:
             health = session->EvaluateHealth(
                 now, config_.idle_timeout_ms, config_.stale_timeout_ms)
@@ -194,13 +206,19 @@ CLASS Server:
                 CASE ConnectionHealth::kStale:
                     stale_conv_list.push_back(conv)
                 CASE ConnectionHealth::kIdle:
+                    idle_count += 1
                     IF config_.idle_policy == IdlePolicy::kSendProbe:
                         session->SendProbePacket()    // 主动发送协议层探活包
                     ELSE IF config_.idle_policy == IdlePolicy::kNotify:
                         // 预留: 通知上层应用空闲事件
                         // IF idle_handler_: idle_handler_(conv)
 
+        LOG_DEBUG("Server health check: {} sessions, {} idle, {} stale",
+                  sessions_.size(), idle_count, stale_conv_list.size())
+
         // 批量驱逐过期会话 (避免在遍历中修改sessions_)
+        FOR EACH conv IN stale_conv_list:
+            LOG_WARN("Server: session conv={} timed out (stale), evicting", conv)
         FOR EACH conv IN stale_conv_list:
             it = sessions_.find(conv)
             IF it != sessions_.end():
@@ -214,6 +232,9 @@ CLASS Server:
             session: std::shared_ptr<Session>,
             reason: EvictReason
     ) -> void:
+        LOG_INFO("Server: evicting session conv={}, reason={}",
+                 session->GetConvId(), EvictReasonToString(reason))
+
         SWITCH config_.eviction_policy:
             CASE EvictionPolicy::kImmediateClose:
                 session->Close()

@@ -42,7 +42,7 @@ CLASS ConfigurationManager:
         default_engine_type: string = "kcp"    // "kcp" / "quic"
         enable_metrics: bool = true            // 是否启用全局指标收集
         log_level: string = "info"             // "trace" / "debug" / "info" / "warn" / "error"
-        log_output: string = "stdout"          // "stdout" / "stderr" / 文件路径
+        log_output: string = "stdout"          // "stdout" / "stderr" / "callback" / 文件路径
         metrics_output: string = ""            // 指标输出目标 (空=不输出, "prometheus://:9090"等)
         max_worker_threads: int = 0            // 最大工作线程数 (0=硬件并发数)
 
@@ -392,6 +392,9 @@ CLASS ConfigurationManager:
         "enable_metrics": true,
         "log_level": "info",
         "log_output": "stdout",
+        //   "stdout" = 标准输出, "stderr" = 标准错误,
+        //   "callback" = 通过LogManager::SetLogCallback注册的回调,
+        //   "/var/log/netlib.log" = 文件路径
         "metrics_output": "",
         "max_worker_threads": 0
     },

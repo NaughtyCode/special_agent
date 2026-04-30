@@ -61,6 +61,7 @@ CLASS EventLoop:
     // 启动事件循环 (阻塞调用,直到外部调用Stop)
     FUNCTION Run() -> void:
         state_ = kRunning
+        LOG_INFO("EventLoop: started (backend={})", BackendToString(impl_.GetBackend()))
         WHILE state_ == kRunning:
             // 步骤1: 获取最近定时器剩余时间作为IO等待上限
             //   std::nullopt 表示无定时器 → 可无限等待,直到IO事件到达
@@ -79,6 +80,8 @@ CLASS EventLoop:
                 IF event.mask HAS kWritable:
                     handler.OnWritable()
                 IF event.mask HAS kError:
+                    LOG_WARN("EventLoop: IO error on fd={}, code={}",
+                             event.fd_or_handle, event.error_code)
                     handler.OnError(event.error_code)
 
             // 步骤4: 触发已到期的定时器回调
@@ -87,6 +90,7 @@ CLASS EventLoop:
             // 步骤5: 批量执行投递的异步任务
             pending_tasks_.ExecuteAll()
 
+        LOG_INFO("EventLoop: stopped")
     // 停止事件循环 (线程安全,可从任何线程调用)
     FUNCTION Stop() -> void:
         state_ = kStopped
@@ -101,6 +105,7 @@ CLASS EventLoop:
             mask: IOMask,
             handler: IEventHandler*
     ) -> void:
+        LOG_DEBUG("EventLoop: registered fd={}, mask={:x}", desc.fd_or_handle, mask)
         impl_.Register(desc, mask, handler)
 
     // 修改已注册描述符的关注事件掩码
@@ -109,6 +114,7 @@ CLASS EventLoop:
 
     // 取消注册 (不再接收此描述符的事件通知)
     FUNCTION Unregister(desc: EventDesc) -> void:
+        LOG_DEBUG("EventLoop: unregistered fd={}", desc.fd_or_handle)
         impl_.Unregister(desc)
 
     // -------------------- 任务投递 --------------------
@@ -126,17 +132,22 @@ CLASS EventLoop:
             delay_ms: uint32_t,
             callback: std::move_only_function<void()>
     ) -> TimerHandle:
-        RETURN timer_queue_.Add(delay_ms, std::move(callback), /*repeat=*/false)
+        handle = timer_queue_.Add(delay_ms, std::move(callback), /*repeat=*/false)
+        LOG_TRACE("EventLoop: timer added, delay={}ms, handle={}", delay_ms, handle)
+        RETURN handle
 
     // 添加周期性定时器,每隔interval_ms重复执行callback
     FUNCTION AddPeriodicTimer(
             interval_ms: uint32_t,
             callback: std::move_only_function<void()>
     ) -> TimerHandle:
-        RETURN timer_queue_.Add(interval_ms, std::move(callback), /*repeat=*/true)
+        handle = timer_queue_.Add(interval_ms, std::move(callback), /*repeat=*/true)
+        LOG_TRACE("EventLoop: periodic timer added, interval={}ms, handle={}", interval_ms, handle)
+        RETURN handle
 
     // 取消定时器 (延迟删除: 仅标记取消,在下次Fire时跳过并清理)
     FUNCTION CancelTimer(handle: TimerHandle) -> void:
+        LOG_TRACE("EventLoop: timer canceled, handle={}", handle)
         timer_queue_.Cancel(handle)
 
     // -------------------- 私有 --------------------
