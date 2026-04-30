@@ -116,11 +116,19 @@ CLASS Server:
         WHILE true:
             recv_result = socket_.RecvFrom(recv_buf_.data(), recv_buf_.size())
             IF NOT recv_result.has_value():
-                BREAK      // 无更多就绪数据报 (std::nullopt)
+                // SocketError (如ICMP不可达): 记录日志,继续循环
+                // Socket错误不影响Socket继续使用,不应中断读取循环
+                LOG_WARN("RecvFrom socket error: {}", static_cast<int>(recv_result.error()))
+                CONTINUE
+            IF NOT recv_result->has_value():
+                BREAK      // nullopt: Socket接收缓冲区已排空,无更多就绪数据报
+
+            // 提取接收结果 (已通过has_value和nullopt检查)
+            auto& result = recv_result.value().value()
 
             // 解析协议头部获取会话标识 (routing_key)
             // conv是KCP的概念,泛化为routing_key以支持其他协议
-            routing_key = ExtractRoutingKey(recv_result->data, recv_result->len)
+            routing_key = ExtractRoutingKey(result.data, result.len)
             IF NOT routing_key.has_value():
                 CONTINUE   // 无效数据包 (长度不足),静默丢弃
 
@@ -128,7 +136,7 @@ CLASS Server:
             it = sessions_.find(routing_key.value())
             IF it != sessions_.end():
                 // 命中已有会话: 直接输入数据
-                it->second->FeedInput(recv_result->data, recv_result->len)
+                it->second->FeedInput(result.data, result.len)
             ELSE:
                 // 未命中: 隐式Accept — 收到首包即创建会话
                 IF config_.max_sessions > 0 AND
@@ -140,11 +148,11 @@ CLASS Server:
                     routing_key.value(),
                     event_loop_,
                     &socket_,
-                    recv_result->sender,
+                    result.sender,
                     config_.session_config
                 )
                 session->Start()
-                session->FeedInput(recv_result->data, recv_result->len)
+                session->FeedInput(result.data, result.len)
 
                 // 注册Session内部事件,向上层传播
                 WireSessionEvents(session)

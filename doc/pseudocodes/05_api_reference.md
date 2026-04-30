@@ -1,6 +1,6 @@
 # API 详细参考文档
 
-本文档列出所有核心接口的完整API定义，包含类/接口名、函数签名、返回值、参数类型和参数名。所有API均为C++17标准，使用 `std::optional`、`std::expected`、`std::move_only_function`、`std::span` 等现代C++特性。
+本文档列出所有核心接口的完整API定义，包含类/接口名、函数签名、返回值、参数类型和参数名。API设计面向现代C++ (C++17为基础,部分类型使用C++20/23标准库设施的polyfill或等效替代: `std::optional`为C++17, `std::span`和`std::expected`可使用等效第三方库或编译器内置, `std::move_only_function`可使用等效的`fu2::unique_function`等)。
 
 ---
 
@@ -130,12 +130,17 @@ void GracefulShutdown(uint32_t timeout_ms = 5000)
 SendResult Send(const std::vector<uint8_t>& data)
 // 返回值: SendResult — kQueued=已加入发送队列, kBlocked=阻塞
 // 参数: data — [in] 待发送的用户数据 (拷贝到内部发送缓冲区)
+// 说明: 成功时更新 stats_.total_bytes_sent 和 total_messages_sent
+//       如需追踪单个消息的送达,使用 OnSendComplete 回调
 
 SendResult Send(const uint8_t* data, size_t len)
 // 返回值: SendResult
 // 参数: data — [in] 数据指针 (不可为nullptr), len — [in] 数据长度 (必须>0)
 // 前置条件: data != nullptr, len > 0
 // 说明: 成功时更新 stats_.total_bytes_sent 和 total_messages_sent
+// 注意: 当前返回值为SendResult枚举,不含message_id;
+//       OnSendComplete回调中的message_id为协议引擎内部分配的序列号,
+//       用于内部追踪; 应用层如需消息级确认,建议在Message载荷中携带业务id
 ```
 
 ### 1.7 协议层数据包发送
@@ -144,12 +149,14 @@ SendResult Send(const uint8_t* data, size_t len)
 void SendHandshakePacket()
 // 返回值: void
 // 说明: 发送协议层握手首包,触发服务端的隐式Accept
-//       由Client在DoConnect()中调用; Peer模式下也可由任一端调用
+//       此方法通常由端点层(Client/Peer)在连接初始化时调用,
+//       应用层不应直接使用 — 误调用可能导致协议状态异常
 
 void SendProbePacket()
 // 返回值: void
-// 说明: 发送协议层探活包 (如KCP的WASK),对端自动回复确认
-//       由Server在空闲检测时调用,或由上层应用主动触发
+// 说明: 发送协议层探活包 (如KCP的WASK命令字),对端自动回复确认
+//       此方法通常由Server在空闲检测时调用,或由应用层在需要主动
+//       检测连接存活时调用 (如: 长时间无业务数据后主动探活)
 ```
 
 ### 1.8 数据接收输入
@@ -160,7 +167,7 @@ void FeedInput(const uint8_t* data, size_t len)
 // 参数: data — [in] 原始数据报载荷, len — [in] 数据长度(字节)
 // 说明: 将底层数据报输入协议引擎解析
 //       内部流程: 更新last_recv_time_ms_ → Engine.Input() → TryRecv() → 触发回调
-//       解析错误时通过OnError回调通知
+//       解析错误时通过OnError回调通知,错误类型见SessionError枚举
 ```
 
 ### 1.9 定时驱动
@@ -187,8 +194,10 @@ void OnStateChange(StateChangeCallback cb)
 // 参数: cb — [in] 状态变更回调,参数为 (old_state, new_state)
 
 void OnSendComplete(SendCompleteCallback cb)
-// 参数: cb — [in] 单个消息完全确认送达时的回调 (可选扩展)
-//       参数 message_id 为发送时返回的序列号
+// 参数: cb — [in] 单个消息完全确认送达时的回调 (可选扩展,用于追踪发送完成)
+//       参数 message_id 为协议引擎内部分配的消息序列号
+//       注意: 此回调在引擎内部确认对端ACK时触发,与Send()返回值无直接关联
+//       典型用途: 应用层在Message载荷中携带业务id,在此回调中确认送达
 ```
 
 ### 1.11 状态查询
@@ -222,8 +231,9 @@ SessionStats GetStats() const
 
 void ApplyConfig(Config config)
 // 参数: config — [in] 新的会话配置
-// 前置条件: state_ == SessionState::kIdle (仅允许在未启动时修改)
-// 说明: 运行时重新配置协议参数 (如MTU/窗口大小)
+// 前置条件: state_ == SessionState::kIdle (配置仅在Start前可修改)
+// 说明: 设置协议参数 (MTU/窗口大小/流控开关等)
+//       如需运行时调整,应在创建新Session时应用新Config
 ```
 
 ---
@@ -345,8 +355,9 @@ size_t GetSessionCount() const
 
 ```
 void OnReadable()
-// 说明: Socket可读时循环接收数据报→解析routing_key→路由到已有Session或创建新Session
-//       边缘触发模式下循环读取直到返回nullopt
+// 说明: Socket可读时循环接收数据报→区分SocketError和nullopt→
+//       解析routing_key→路由到已有Session或创建新Session
+//       边缘触发模式下循环读取直到返回nullopt (无更多数据)
 ```
 
 ---
@@ -427,26 +438,30 @@ void Connect(
     ConnectFailureHandler on_failure = nullptr
 )
 // 说明: 异步连接,非阻塞立即返回
-//       流程: 创建Session → 发送握手首包 → 等待服务器响应
+//       流程: 断开旧连接(如有) → 创建Session → 发送握手首包 → 等待服务器响应
 //       成功: 收到服务器首次有效响应后回调on_success
 //       失败: 超时且无重连或达到最大重试次数后回调on_failure
+// 注意: 每次Connect调用会覆盖上一次注册的handler (最后一个Connect生效)
+//       重复Connect时旧连接自动Disconnect
 
 void Disconnect()
-// 说明: 断开连接,取消重连,关闭并释放Session
+// 说明: 断开连接,取消所有重连定时器,关闭并释放Session
 // 后置条件: state_ == ClientState::kDisconnected
+// 幂等: 重复调用安全
 ```
 
 ### 3.6 数据发送
 
 ```
 SendResult Send(const std::vector<uint8_t>& data)
-// 返回值: SendResult — kQueued=已加入队列, kBlocked=未连接或窗口满
+// 返回值: SendResult — kQueued=已加入队列, kBlocked=当前不可发送
 // 参数: data — [in] 待发送数据
+// 说明: state_ != kConnected时返回kBlocked (调用方应检查返回值或等待kConnected)
 
 SendResult Send(const uint8_t* data, size_t len)
 // 返回值: SendResult
 // 参数: data — [in] 数据指针 (不可为nullptr), len — [in] 数据长度 (必须>0)
-// 前置条件: state_ == ClientState::kConnected
+// 说明: state_ != kConnected时返回kBlocked,调用方负责重试或丢弃
 ```
 
 ### 3.7 状态查询
@@ -463,10 +478,9 @@ ClientState GetState() const
 
 ```
 void OnReadable()
-// 说明: Socket可读时循环接收数据报
-//       验证: 源地址==remote_address AND routing_key匹配
-//       通过验证后调用session->FeedInput()
-//       首次收到有效响应时自动从kConnecting转为kConnected
+// 说明: Socket可读时循环接收数据报→区分SocketError和nullopt→
+//       验证源地址和routing_key→通过后调用session->FeedInput()
+//       首次收到有效响应时自动从kConnecting转为kConnected并触发success_handler
 ```
 
 ---
@@ -477,7 +491,8 @@ void OnReadable()
 类名: EventLoop
 头文件: event_loop.h
 描述: 跨平台IO事件循环抽象,统一封装epoll/IOCP/kqueue/poll
-     线程安全: Start/Stop线程安全, Register/Modify/Unregister必须在所属线程调用
+     线程安全: Stop可从任何线程调用; Run在调用线程阻塞执行;
+              Register/Modify/Unregister必须在EventLoop所属线程调用
 ```
 
 ### 4.1 枚举与类型
@@ -500,7 +515,7 @@ enum class IOMask : uint8_t {
 
 struct EventDesc {
     uintptr_t fd_or_handle;      // 文件描述符 (POSIX) 或句柄 (Windows)
-    // Platform platform_tag;    // 平台标记 (内部使用)
+    // Platform platform_tag;    // 平台标记 (内部使用,调用方无需设置)
 };
 ```
 
@@ -512,9 +527,8 @@ EventLoop(IOBackend backend = IOBackend::kAutoDetect)
 
 void Run()
 // 返回值: void
-// 说明: 阻塞运行事件循环
+// 说明: 阻塞运行事件循环 (在调用线程阻塞,直到Stop()被调用)
 //       每轮循环: IO事件等待 → 分派Handler → 触发到期定时器 → 执行异步任务
-//       循环直到外部调用Stop()
 
 void Stop()
 // 返回值: void
@@ -523,8 +537,8 @@ void Stop()
 
 void Register(EventDesc desc, IOMask mask, IEventHandler* handler)
 // 参数: desc    — [in] 文件描述符或句柄
-//       mask    — [in] 关注的事件位掩码 (可组合)
-//       handler — [in] 事件回调接口 (生命周期由调用方保证)
+//       mask    — [in] 关注的事件位掩码 (可组合,如 kReadable | kEdgeTriggered)
+//       handler — [in] 事件回调接口 (生命周期由调用方保证,需在Unregister前有效)
 // 说明: 注册文件描述符及其关注的事件类型
 
 void Modify(EventDesc desc, IOMask new_mask)
@@ -539,15 +553,15 @@ void Unregister(EventDesc desc)
 void PostTask(std::move_only_function<void()> task)
 // 参数: task — [in] 可移动闭包
 // 说明: 向EventLoop线程安全投递任务,常用于跨线程操作
-//       内部Push到任务队列后WakeUp()唤醒事件循环
+//       内部Push到任务队列后WakeUp()唤醒事件循环 (如当前正在阻塞等待IO)
 
 TimerHandle AddTimer(
     uint32_t delay_ms,
     std::move_only_function<void()> callback
 )
-// 返回值: TimerHandle — 定时器句柄 (用于取消)
+// 返回值: TimerHandle — 定时器句柄 (用于取消,0为无效句柄)
 // 参数: delay_ms — [in] 延迟时间(ms)
-//       callback — [in] 到期时执行的回调 (一次性)
+//       callback — [in] 到期时执行的回调 (一次性触发)
 // 说明: 添加一次性定时器
 
 TimerHandle AddPeriodicTimer(
@@ -560,7 +574,7 @@ TimerHandle AddPeriodicTimer(
 // 说明: 添加周期性定时器,每隔interval_ms重复触发
 
 void CancelTimer(TimerHandle handle)
-// 参数: handle — [in] 定时器句柄
+// 参数: handle — [in] 定时器句柄 (0=无效,直接忽略)
 // 说明: 取消指定定时器 (延迟删除: 标记取消,在下次Fire时跳过并清理)
 ```
 
@@ -572,7 +586,9 @@ void CancelTimer(TimerHandle handle)
 类名: DatagramSocket
 头文件: datagram_socket.h
 描述: 非阻塞数据报Socket的RAII封装,抽象UDP/UDPLite/Unix Domain Dgram
-     线程安全: 非线程安全,所有操作必须在所属EventLoop线程执行
+     线程安全: SendTo和RecvFrom的底层系统调用本身是线程安全的 (OS保证),
+             但EventLoop注册操作 (SetReadHandler/EnableWriteNotifications等)
+             必须在EventLoop所属线程调用
 ```
 
 ### 5.1 公有接口
@@ -583,17 +599,18 @@ DatagramSocket(
     Address bind_addr = Address::Any(),
     SocketConfig config = SocketConfig::Default()
 )
-// 参数: event_loop — [in] 事件循环 (用于Register)
+// 参数: event_loop — [in] 事件循环 (用于后续Register操作)
 //       bind_addr  — [in] 绑定地址 (Any()=任意地址随机端口)
 //       config     — [in] Socket选项配置
-// 后置条件: Socket已创建/绑定/设为非阻塞
+// 后置条件: Socket已创建/绑定/设为非阻塞模式
+// 异常: 创建或绑定失败时抛出std::runtime_error
 
 std::expected<int, SocketError> SendTo(
     const uint8_t* data, size_t len, Address dest
 )
 // 返回值: std::expected<int, SocketError>
-//         成功 → 发送字节数
-//         失败 → SocketError (kWouldBlock表示发送缓冲区满,可等待可写事件)
+//         成功 → 实际发送字节数
+//         失败 → SocketError (kWouldBlock表示发送缓冲区满,需等待可写事件后重试)
 // 参数: data — [in] 待发送数据指针
 //       len  — [in] 数据长度
 //       dest — [in] 目标地址
@@ -602,25 +619,31 @@ std::expected<std::optional<RecvResult>, SocketError> RecvFrom(
     uint8_t* buffer, size_t buffer_capacity
 )
 // 返回值: std::expected<std::optional<RecvResult>, SocketError>
-//         成功且有数据  → RecvResult (含数据指针/长度/来源/时间戳)
-//         成功但无数据  → std::nullopt (非阻塞模式正常,需等待下次可读事件)
-//         失败          → SocketError (ICMP错误等不影响Socket继续使用)
+//         成功且有数据  → std::optional包含RecvResult
+//         成功但无数据  → std::optional为nullopt (非阻塞模式正常,需等待下次可读事件)
+//         Socket错误    → std::unexpected(SocketError)
 // 参数: buffer          — [out] 接收缓冲区 (数据写入此处)
-//       buffer_capacity — [in]  缓冲区可用容量
+//       buffer_capacity — [in]  缓冲区可用容量 (应等于buffer的size())
 // 注意: RecvResult::data 指向传入的buffer,生命周期与buffer一致
+// 调用方应区分SocketError和nullopt两种情况:
+//   - nullopt: 无就绪数据,继续等待下次OnReadable (正常流程)
+//   - SocketError: 记录日志,通常可继续使用Socket (ICMP错误不影响后续操作)
 
 void SetReadHandler(IEventHandler* handler)
 // 参数: handler — [in] 事件处理器 (实现OnReadable/OnWritable/OnError)
 // 说明: 向EventLoop注册此Socket的可读事件 (边缘触发模式)
+//       必须在EventLoop线程调用
 
 void EnableWriteNotifications(IEventHandler* handler)
 // 参数: handler — [in] 事件处理器
 // 说明: 启用可写通知 (发送缓冲区从满→可用时通知)
 //       仅在SendTo返回kWouldBlock后需要等待恢复时使用
+//       必须在EventLoop线程调用
 
 void DisableWriteNotifications(IEventHandler* handler)
 // 参数: handler — [in] 事件处理器
 // 说明: 关闭可写通知 (恢复为仅监听可读,减少不必要的事件触发)
+//       必须在EventLoop线程调用
 ```
 
 ### 5.2 辅助类型
@@ -665,6 +688,12 @@ struct DatagramSocket::SocketConfig {
     // 返回值: 默认配置 (reuse_addr=true, buf=256KB, dscp=0, ttl=64)
 };
 
+enum class AddressFamily {
+    kIPv4,
+    kIPv6,
+    kUnixDomain
+};
+
 enum class SocketError {
     kWouldBlock,        // 操作会阻塞 (非阻塞模式正常,调用方应等待事件)
     kConnectionRefused, // ICMP端口不可达 (目标无监听进程)
@@ -682,7 +711,7 @@ enum class SocketError {
 class IEventHandler {
 public:
     virtual void OnReadable() = 0;
-    // 描述符可读时调用 (边缘触发: 需循环读取直到EAGAIN)
+    // 描述符可读时调用 (边缘触发: 需循环读取直到EAGAIN/EWOULDBLOCK)
 
     virtual void OnWritable() { }
     // 描述符可写时调用 (发送缓冲区从满→可用)
@@ -690,7 +719,7 @@ public:
 
     virtual void OnError(int error_code) { }
     // 描述符异常时调用 (如ICMP错误)
-    // 参数: error_code — 平台相关错误码
+    // 参数: error_code — 平台相关错误码 (Windows: WSAError, POSIX: errno)
     // 默认空实现: 大多数错误已在RecvFrom/SendTo返回值中体现
 
     virtual ~IEventHandler() = default;
@@ -714,8 +743,8 @@ public:
 enum class DispatchStrategy {
     kModuloHash,      // hash(routing_key) % N (默认,适合均匀分布)
     kConsistentHash,  // 一致性哈希环 (适合动态增减Worker)
-    kRoundRobin,      // 轮询 (原子计数器递增)
-    kLeastSessions    // 最少会话优先 (适合不均匀负载)
+    kRoundRobin,      // 轮询 (原子计数器递增,不依赖routing_key)
+    kLeastSessions    // 最少会话优先 (适合负载不均匀场景)
 };
 ```
 
@@ -726,12 +755,12 @@ WorkerPool(
     size_t num_workers = 0,                                   // 0=自动检测CPU核心数
     DispatchStrategy strategy = DispatchStrategy::kModuloHash
 )
-// 参数: num_workers — [in] Worker线程数 (0=hardware_concurrency)
+// 参数: num_workers — [in] Worker线程数 (0=std::thread::hardware_concurrency)
 //       strategy    — [in] 分配策略
 // 后置条件: 所有Worker线程已启动,各自的EventLoop::Run()正在运行
 
-void Dispatch(uint64_t routing_key, std::move_only_function<void()> task)
-// 参数: routing_key — [in] 路由键 (通常为Session的conv)
+void Dispatch(uint32_t routing_key, std::move_only_function<void()> task)
+// 参数: routing_key — [in] 路由键 (通常为Session的conv, uint32_t)
 //       task        — [in] 待投递任务
 // 说明: 根据routing_key和策略选择目标Worker,调用其EventLoop::PostTask()
 //       线程安全: 可从任何线程调用
@@ -758,19 +787,19 @@ void Shutdown()
 ```
 void Push(std::move_only_function<void()> task)
 // 参数: task — [in] 可移动闭包
-// 说明: 线程安全地入队 (多生产者),入队后notify_one
+// 说明: 线程安全地入队 (多生产者),入队后notify_one唤醒消费者
 
 std::move_only_function<void()> Pop()
 // 返回值: 队列头部任务
-// 说明: 阻塞等待直到队列非空,取出并返回 (单消费者)
+// 说明: 阻塞等待直到队列非空,取出并返回 (仅单消费者线程调用)
 
 std::optional<std::move_only_function<void()>> TryPop()
 // 返回值: 队列头部任务,队列为空时返回std::nullopt
-// 说明: 非阻塞版本,立即返回
+// 说明: 非阻塞版本,立即返回 (通常用于批量消费前的快速检查)
 
 void ExecuteAll()
 // 说明: 批量消费: 加锁→交换到本地队列→解锁→在锁外执行所有任务
-//       减少锁竞争,适合在EventLoop主循环末尾调用
+//       减少锁竞争 (单次加锁处理全部积压),适合在EventLoop主循环末尾调用
 ```
 
 ---
@@ -782,42 +811,42 @@ void ExecuteAll()
 头文件: timer_queue.h
 描述: 基于小顶堆的定时器管理器 (可替换为分层时间轮)
      支持一次性/周期性定时器,延迟删除 (标记取消)
-     所有操作线程安全
+     所有公开操作线程安全
 ```
 
 ### 9.1 公有接口
 
 ```
-using TimerHandle = uint64_t;   // 定时器唯一标识
+using TimerHandle = uint64_t;   // 定时器唯一标识, 0=无效句柄
 
 TimerHandle Add(
     uint32_t delay_or_interval_ms,
     std::move_only_function<void()> callback,
     bool repeat
 )
-// 返回值: TimerHandle — 定时器句柄 (用于取消)
+// 返回值: TimerHandle — 定时器句柄 (用于取消, >0的有效值)
 // 参数: delay_or_interval_ms — [in] 延迟/间隔时间(ms)
 //       callback              — [in] 到期时执行的回调
-//       repeat                — [in] true=周期性, false=一次性
+//       repeat                — [in] true=周期性重复, false=一次性
 // 说明: 线程安全,返回唯一句柄
 
 void Cancel(TimerHandle id)
-// 参数: id — [in] 定时器句柄
+// 参数: id — [in] 定时器句柄 (0=无效,直接忽略; 已取消的句柄幂等)
 // 说明: 延迟删除: 标记取消,在下次GetNextTimeout或FireExpired时惰性清理
-//       保证: Cancel后回调不会再被触发
+//       保证: Cancel返回后,对应回调不会再被触发
 
 std::optional<uint32_t> GetNextTimeout()
 // 返回值: 距最近定时器到期的剩余时间(ms)
-//         std::nullopt = 无待触发定时器 (EventLoop可无限等待)
-// 说明: 内部惰性清理堆顶已取消条目
+//         std::nullopt = 无待触发定时器 (EventLoop可无限等待IO事件)
+// 说明: 内部惰性清理堆顶已取消条目 (确保返回的是有效定时器的到期时间)
 
 void FireExpired(uint64_t now_ms)
-// 参数: now_ms — [in] 当前时间(ms)
-// 说明: 执行所有已到期的定时器回调
-//       一次性定时器: 执行后移除
-//       周期性定时器: 更新到期时间后重新入堆
-//       已取消的: 跳过并清理
-// 注意: 回调在持有锁时执行,如回调可能耗时,应改为投递到TaskQueue
+// 参数: now_ms — [in] 当前时间戳(ms)
+// 说明: 执行所有到期时刻 <= now_ms 的定时器回调
+//       一次性: 执行后移除
+//       周期性: 执行后更新expire_time为 now_ms + interval_ms 并重新入堆
+//       已取消: 跳过并清理canceled_集合中的记录
+// 注意: 回调在持有锁时执行,如回调可能耗时,应改为在回调中PostTask异步执行
 ```
 
 ---
@@ -827,24 +856,24 @@ void FireExpired(uint64_t now_ms)
 ```
 // 时钟
 namespace Clock {
-    uint64_t NowMs();   // 返回当前wall-clock时间戳(毫秒),单调递增
-    uint64_t NowUs();   // 微秒精度 (用于精确RTT计算)
+    uint64_t NowMs();   // 返回当前wall-clock时间戳(毫秒),单调递增保证
+    uint64_t NowUs();   // 返回微秒时间戳 (用于精确RTT计算和性能测量)
 }
 
-// 运行时统计
+// 运行时统计 (所有计数器为单调递增)
 struct SessionStats {
     uint64_t total_bytes_sent;         // 累计发送字节数
     uint64_t total_bytes_recv;         // 累计接收字节数
-    uint64_t total_messages_sent;      // 累计发送消息数
-    uint64_t total_messages_recv;      // 累计接收消息数
-    uint64_t total_packets_sent;       // 累计发送包数
-    uint64_t total_packets_recv;       // 累计接收包数
+    uint64_t total_messages_sent;      // 累计发送消息数 (Send调用次数)
+    uint64_t total_messages_recv;      // 累计接收消息数 (OnMessage触发次数)
+    uint64_t total_packets_sent;       // 累计发送包数 (含重传/ACK/探活)
+    uint64_t total_packets_recv;       // 累计接收包数 (所有入站数据报)
     uint64_t total_retransmissions;    // 累计重传次数
-    uint32_t estimated_rtt_ms;         // 当前估计RTT (ms)
+    uint32_t estimated_rtt_ms;         // 当前平滑RTT估计值 (ms)
     uint32_t send_window_used;         // 当前发送窗口占用 (包数)
     uint32_t recv_window_used;         // 当前接收窗口占用 (包数)
-    uint64_t created_at_ms;            // Session创建时间戳
-    uint64_t last_activity_ms;         // 最后活动时间戳
+    uint64_t created_at_ms;            // Session创建时刻 (Clock::NowMs)
+    uint64_t last_activity_ms;         // 最后活动时刻 (收发任一方向)
 };
 
 // 全局库配置
@@ -861,12 +890,12 @@ public:
 
     const uint8_t* Data() const;                       // 只读数据指针
     size_t Size() const;                               // 数据长度(字节)
-    std::span<const uint8_t> AsSpan() const;           // C++20 span视图 (零拷贝)
-    std::string_view AsStringView() const;             // 字符串视图 (零拷贝)
-    std::vector<uint8_t> TakeBytes();                  // 移动取出所有权 (跨线程传递)
+    std::span<const uint8_t> AsSpan() const;           // span视图 (零拷贝,需C++20或polyfill)
+    std::string_view AsStringView() const;             // 字符串视图 (零拷贝, C++17)
+    std::vector<uint8_t> TakeBytes();                  // 移动取出所有权 (跨线程传递,避免拷贝)
 
-    uint32_t session_id;                               // 来源会话ID
-    uint64_t receive_time_ms;                          // 接收时间戳
+    uint32_t session_id;                               // 来源会话ID (routing_key)
+    uint64_t receive_time_ms;                          // 接收时间戳 (Clock::NowMs)
 };
 ```
 
@@ -877,68 +906,107 @@ public:
 ```
 // ============================================================
 // 描述: 协议引擎抽象接口 — 实现此接口即可替换底层传输协议
-//       默认实现: KCP (ikcp_* API封装)
-//       可替换: 自定义可靠UDP / QUIC-like / Mock引擎
+//       默认实现: KCP (ikcp_* C API封装)
+//       可替换为: 自定义可靠UDP / QUIC-like / Mock引擎 (测试用)
 // ============================================================
 
+// 解析结果: 引擎Input()的返回值
+STRUCT ParseResult:
+    success: bool             // true=解析成功, false=发生错误
+    error: std::optional<SessionError>  // 失败时的错误类型,成功时为nullopt
+    bytes_consumed: size_t    // 此次Input消耗的字节数
+
+    STATIC FUNCTION Ok(consumed: size_t) -> ParseResult:
+        RETURN ParseResult{.success=true, .error=std::nullopt, .bytes_consumed=consumed}
+
+    STATIC FUNCTION Err(e: SessionError) -> ParseResult:
+        RETURN ParseResult{.success=false, .error=e, .bytes_consumed=0}
+
 CLASS ProtocolEngine:
-    // 输出回调: 引擎产生的底层数据包通过此回调发出
+    // -------------------- 生命周期回调 --------------------
+
+    // 注册输出回调: 引擎产生的底层数据包通过此回调发出
+    // Session在构造时注册,将数据包导向DatagramSocket::SendTo
     VIRTUAL FUNCTION SetOutputCallback(
         cb: std::move_only_function<void(const uint8_t* data, size_t len)>
     ) -> void = 0
 
-    // 输入原始数据报到引擎
-    VIRTUAL FUNCTION Input(data: const uint8_t*, len: size_t) -> ParseResult = 0
+    // -------------------- 数据输入 --------------------
 
-    // 发送用户数据
+    // 将原始数据报输入引擎进行解析
+    // 引擎内部根据命令字路由: DATA→插入接收缓冲, ACK→确认发送包, PROBE→回复探测
+    VIRTUAL FUNCTION Input(
+        data: const uint8_t*, len: size_t
+    ) -> ParseResult = 0
+
+    // -------------------- 数据发送 --------------------
+
+    // 将用户数据加入发送队列 (拷贝到引擎内部发送缓冲区)
+    // 实际发送在Update中根据窗口和MTU分段发出
     VIRTUAL FUNCTION Send(data: const uint8_t*, len: size_t) -> SendResult = 0
 
-    // 驱动引擎状态机
+    // -------------------- 定时驱动 --------------------
+
     VIRTUAL FUNCTION Update(now_ms: uint64_t) -> void = 0
+    // 参数: now_ms — [in] 当前时间戳(ms)
+    // 内部: 检查RTO→标记重传→快速重传判定→发送待发数据→更新RTT→流控状态更新
 
-    // 取出完整用户消息
+    // -------------------- 消息取出 --------------------
+
     VIRTUAL FUNCTION PeekMessageSize() -> int = 0
-    VIRTUAL FUNCTION RecvMessage(buffer: uint8_t*, max_len: size_t) -> int = 0
+    // 返回值: >0 = 下一条完整用户消息的字节数
+    //          0 = 当前无完整消息就绪 (等待更多数据)
+    //         <0 = 内部错误
 
-    // 发送协议层命令包
-    VIRTUAL FUNCTION SendHandshake() -> void = 0     // 握手包
-    VIRTUAL FUNCTION SendProbe() -> void = 0         // 探活包
-    VIRTUAL FUNCTION NotifyClose() -> void = 0       // 关闭通知
-    VIRTUAL FUNCTION SendShutdownNotification() -> void = 0  // 优雅关闭通知
+    VIRTUAL FUNCTION RecvMessage(
+        buffer: uint8_t*, max_len: size_t
+    ) -> int = 0
+    // 返回值: >0 = 实际拷贝到buffer的消息字节数
+    //          0 = 无消息 (应先用PeekMessageSize检查)
+    //         <0 = 错误
+    // 参数: buffer  — [out] 消息写入目标
+    //       max_len — [in]  buffer可用容量 (应 >= PeekMessageSize())
 
-    // 配置与重置
+    // -------------------- 协议命令包 --------------------
+
+    VIRTUAL FUNCTION SendHandshake() -> void = 0
+    // 发送握手首包 (如KCP的空数据包或SYN-like命令)
+
+    VIRTUAL FUNCTION SendProbe() -> void = 0
+    // 发送探活包 (如KCP的WASK),对端收到后自动回复
+
+    VIRTUAL FUNCTION NotifyClose() -> void = 0
+    // 构建并发送关闭通知包
+
+    VIRTUAL FUNCTION SendShutdownNotification() -> void = 0
+    // 构建并发送优雅关闭通知,区别于NotifyClose:
+    // NotifyClose用于立即关闭; SendShutdownNotification用于GracefulShutdown流程
+
+    // -------------------- 配置与重置 --------------------
+
     VIRTUAL FUNCTION ApplyConfig(config: Session::Config) -> void = 0
-    VIRTUAL FUNCTION ResetBuffers() -> void = 0       // 清空收发缓冲
+    // 将Session::Config中的参数应用到协议引擎 (MTU/窗口/nodelay/流控等)
+
+    VIRTUAL FUNCTION ResetBuffers() -> void = 0
+    // 清空引擎内部的收发缓冲区 (丢弃未发送数据和未交付消息)
+    // 通常在Close时调用
 
     VIRTUAL ~ProtocolEngine() = default
 
 // 工厂函数
 namespace ProtocolEngineFactory {
     std::unique_ptr<ProtocolEngine> Create(Session::Config config);
-    // 默认实现: 创建KCP引擎实例,封装ikcp_create/ikcp_setoutput等
-    // 扩展: 可通过注册自定义工厂来支持其他协议实现
+    // 默认: 创建KCP引擎实例 (封装ikcp_create/ikcp_setoutput/ikcp_nodelay/ikcp_wndsize等)
+    // 扩展: 可通过注册自定义工厂函数来支持其他协议引擎实现
+    // 用法: 在库初始化时调用 RegisterFactory("my_protocol", myFactoryFunction)
 }
 ```
 
-## 12. 其他基础类型
+---
+
+## 附录: 类型速查
 
 ```
-// 定时器句柄
-using TimerHandle = uint64_t;   // 0=无效句柄, >0=有效
-
-// 地址族
-enum class AddressFamily {
-    kIPv4,
-    kIPv6,
-    kUnixDomain
-};
-
-// IO后端选择
-enum class IOBackend {
-    kAutoDetect,  // 运行时自动检测平台最优IO模型
-    kEpoll,       // Linux epoll (推荐)
-    kIocp,        // Windows I/O Completion Port
-    kKqueue,      // macOS / FreeBSD kqueue
-    kPoll         // POSIX poll (通用性最好,性能最差)
-};
+// TimerHandle — 定时器句柄
+using TimerHandle = uint64_t;   // 0=无效句柄 (由EventLoop和TimerQueue共用)
 ```

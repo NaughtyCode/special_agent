@@ -217,21 +217,29 @@ CLASS Client:
         WHILE true:
             recv_result = socket_.RecvFrom(recv_buf_.data(), recv_buf_.size())
             IF NOT recv_result.has_value():
-                BREAK      // 无更多就绪数据报
+                // SocketError (如ICMP不可达): 记录日志,继续循环
+                // Socket错误不影响Socket继续使用,不应中断读取循环
+                LOG_WARN("RecvFrom socket error: {}", static_cast<int>(recv_result.error()))
+                CONTINUE
+            IF NOT recv_result->has_value():
+                BREAK      // nullopt: Socket接收缓冲区已排空,无更多就绪数据报
+
+            // 提取接收结果 (已通过双检)
+            auto& result = recv_result.value().value()
 
             // 源地址验证: 仅处理来自目标服务器的数据报 (防窃听/注入)
-            IF recv_result->sender != config_.remote_address:
+            IF result.sender != config_.remote_address:
                 CONTINUE
 
             // 路由键验证: 仅处理属于本会话的数据报
             // 过路包 (旧会话残留/路由错误) 直接丢弃
-            IF recv_result->len >= 4:
-                pkt_conv = ReadBigEndianU32(recv_result->data, 0)
+            IF result.len >= 4:
+                pkt_conv = ReadBigEndianU32(result.data, 0)
                 IF pkt_conv != conv_:
                     CONTINUE
 
             IF session_ != nullptr:
-                session_->FeedInput(recv_result->data, recv_result->len)
+                session_->FeedInput(result.data, result.len)
 
                 // 首次收到有效服务器响应 → 连接正式建立
                 IF state_ == ClientState::kConnecting:

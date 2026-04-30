@@ -8,7 +8,7 @@ claude --dangerously-skip-permissions
 1. 按 ./doc/issues/issue1.txt 的要求执行
 2. 按 ./doc/issues/issue2.txt 的要求执行
 3. 按 ./doc/issues/issue3.txt 的要求执行
-
+4. 按 ./doc/issues/issue4.txt 的要求执行
 
 
 
