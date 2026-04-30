@@ -224,7 +224,7 @@ CLASS DatagramSocket:
         // 创建数据报Socket,设为非阻塞模式
         fd_ = ::socket(bind_addr.family.ToSystem(), SOCK_DGRAM, 0)
         IF fd_ < 0:
-            THROW SocketException("socket() failed", SocketError::FromErrno(errno))
+            THROW std::runtime_error("socket() failed")
         SetNonBlocking(fd_, true)
 
         // 通用Socket选项 (从config读取,无硬编码)
@@ -365,14 +365,14 @@ CLASS WorkerPool:
 
     // 根据routing_key选择目标Worker并投递任务
     FUNCTION Dispatch(
-            routing_key: uint64_t,
+            routing_key: uint32_t,
             task: std::move_only_function<void()>
     ) -> void:
         index = SelectWorker(routing_key)
         workers_[index].event_loop.PostTask(std::move(task))
 
     // 选择目标Worker
-    PRIVATE FUNCTION SelectWorker(routing_key: uint64_t) -> size_t:
+    PRIVATE FUNCTION SelectWorker(routing_key: uint32_t) -> size_t:
         SWITCH strategy_:
             CASE kModuloHash:
                 RETURN routing_key MOD workers_.size()

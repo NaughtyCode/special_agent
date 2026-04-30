@@ -231,13 +231,21 @@ CLASS Client:
     // -------------------- IEventHandler 实现: 数据报到达处理 --------------------
 
     FUNCTION OnReadable() -> void:
+        consecutive_errors = 0
         WHILE true:
             recv_result = socket_.RecvFrom(recv_buf_.data(), recv_buf_.size())
             IF NOT recv_result.has_value():
                 // SocketError (如ICMP不可达): 记录日志,继续循环
                 // Socket错误不影响Socket继续使用,不应中断读取循环
+                // 但连续过多错误说明Socket可能已损坏,中止循环防止忙等
+                consecutive_errors += 1
                 LOG_WARN("RecvFrom socket error: {}", static_cast<int>(recv_result.error()))
+                IF consecutive_errors >= kMaxConsecutiveRecvErrors:
+                    LOG_ERROR("Too many consecutive RecvFrom errors ({}), breaking read loop",
+                              consecutive_errors)
+                    BREAK
                 CONTINUE
+            consecutive_errors = 0   // 成功读取时重置计数器
             IF NOT recv_result->has_value():
                 BREAK      // nullopt: Socket接收缓冲区已排空,无更多就绪数据报
 
@@ -278,10 +286,13 @@ CLASS Client:
             IF state_ == ClientState::kConnected:
                 // 已建立的连接断开 → 尝试重连
                 IF config_.reconnect.has_value():
-                    state_ = ClientState::kReconnecting
-                    retry_count_ = 0
+                    // 清理当前Session并进入重连流程
+                    IF session_:
+                        session_->Close()
+                        session_.reset()
+                    // 通过PostTask异步发起重连(避免在Session回调中修改自身状态)
                     event_loop_.PostTask([this]():
-                        OnConnectTimeout()   // 复用超时逻辑中的重连流程
+                        DoConnect()   // 直接创建新Session并发起连接
                     )
                 ELSE:
                     NotifyConnectFailure(ConnectError::kSocketError)

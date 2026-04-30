@@ -101,15 +101,20 @@ CLASS LogManager:
 
         // 步骤4: 致命级别后可选处理
         IF level == Level::kFatal:
-            // 可选: 刷新所有日志缓冲 → 调用用户注册的fatal handler
-            // 注意: 不在此处调用std::abort,由应用层决定
+            // 刷新日志缓冲确保fatal消息不丢失
+            Flush()
+            // 调用应用注册的fatal handler (如果存在)
+            IF fatal_handler_:
+                fatal_handler_(file, line, function, message)
 
     // 冲刷日志 (确保所有已写入的日志被输出)
     STATIC FUNCTION Flush() -> void:
         // 如果日志回调内部有缓冲区,此处触发冲刷
+        // 对于无缓冲回调 (stdout/stderr),此为空操作
         LOCK(callback_mutex_):
-            // 预留: 调用flush语义
-            // 对于无缓冲回调 (stdout/stderr),此为空操作
+            // 回调本身可能持有内部缓冲区 (如FILE*),flush语义由回调实现决定
+            // LogManager不直接flush文件描述符,而是依赖回调内的fflush/fsync
+            // 如需强制落盘,应用层应在注册回调时自行处理flush逻辑
 
     // -------------------- 私有成员 --------------------
     PRIVATE:
@@ -137,7 +142,7 @@ CLASS LogManager:
     #ELSE
         #DEFINE LOG_COMPILE_MIN_LEVEL  LogManager::Level::kTrace  // Debug: 保留全部
     #ENDIF
-#endif
+#ENDIF   // LOG_COMPILE_MIN_LEVEL guard
 
 // 编译期级别检查: 低于裁剪级别的Log调用被编译器完全移除
 #define LOG_IS_COMPILE_ENABLED(level) \

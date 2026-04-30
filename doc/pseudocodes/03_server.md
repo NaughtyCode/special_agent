@@ -119,13 +119,22 @@ CLASS Server:
 
     FUNCTION OnReadable() -> void:
         // 边缘触发模式: 循环读取直到Socket缓冲区排空
+        // 连续错误计数器: 防止持久性Socket错误导致无限循环
+        consecutive_errors = 0
         WHILE true:
             recv_result = socket_.RecvFrom(recv_buf_.data(), recv_buf_.size())
             IF NOT recv_result.has_value():
                 // SocketError (如ICMP不可达): 记录日志,继续循环
                 // Socket错误不影响Socket继续使用,不应中断读取循环
+                // 但连续过多错误说明Socket可能已损坏,中止循环防止忙等
+                consecutive_errors += 1
                 LOG_WARN("RecvFrom socket error: {}", static_cast<int>(recv_result.error()))
+                IF consecutive_errors >= kMaxConsecutiveRecvErrors:
+                    LOG_ERROR("Too many consecutive RecvFrom errors ({}), breaking read loop",
+                              consecutive_errors)
+                    BREAK
                 CONTINUE
+            consecutive_errors = 0   // 成功读取时重置计数器
             IF NOT recv_result->has_value():
                 BREAK      // nullopt: Socket接收缓冲区已排空,无更多就绪数据报
 
@@ -384,7 +393,6 @@ FUNCTION SendProbe(session: std::shared_ptr<Session>):
     //   KCP:  WASK命令字,对端自动回复WINS
     //   QUIC: PING帧,对端自动回复PONG或携带数据的ACK
     // 完成一次心跳往返,本端在后续FeedInput中会更新last_recv_time_ms_
-    // 本端在后续FeedInput中会更新last_recv_time_ms_
     session->SendProbePacket()
 
 // --------------------------------------------------

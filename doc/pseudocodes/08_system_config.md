@@ -49,10 +49,10 @@ CLASS ConfigurationManager:
     // Socket默认配置
     STRUCT SocketConfig:
         reuse_addr: bool = true                // SO_REUSEADDR
-        recv_buf_bytes: int = 262144           // SO_RCVBUF (256KB)
-        send_buf_bytes: int = 262144           // SO_SNDBUF (256KB)
-        dscp: int = 0                          // DSCP/TOS QoS标记 (0=默认)
-        ttl: int = 64                          // TTL
+        recv_buf_bytes: uint32_t = 262144      // SO_RCVBUF (256KB)
+        send_buf_bytes: uint32_t = 262144      // SO_SNDBUF (256KB)
+        dscp: uint8_t = 0                      // DSCP/TOS QoS标记 (0=默认)
+        ttl: uint8_t = 64                      // TTL
 
     // Session默认配置 (新Session的初始配置模板)
     STRUCT SessionDefaultsConfig:
@@ -65,8 +65,8 @@ CLASS ConfigurationManager:
         mtu_bytes: int = 1400                  // 最大传输单元(字节)
         send_window_packets: int = 128         // 发送窗口(包数)
         recv_window_packets: int = 128         // 接收窗口(包数)
-        rx_buffer_init_bytes: int = 65536      // 接收缓冲初始大小(64KB)
-        tx_buffer_init_bytes: int = 65536      // 发送缓冲初始大小(64KB)
+        rx_buffer_init_bytes: size_t = 65536    // 接收缓冲初始大小(64KB)
+        tx_buffer_init_bytes: size_t = 65536    // 发送缓冲初始大小(64KB)
         enable_metrics: bool = true            // 会话级指标收集
 
     // 服务端端点配置
@@ -81,6 +81,7 @@ CLASS ConfigurationManager:
         stale_timeout_ms: int = 30000          // 过期驱逐阈值(ms)
         eviction_policy: string = "immediate"  // "immediate" / "graceful" / "notify_only"
         idle_policy: string = "probe"          // "ignore" / "probe" / "notify"
+        socket_config: SocketConfig            // 端点级Socket配置 (覆盖全局socket_defaults)
         recv_buf_init_bytes: int = 65536       // 接收缓冲区初始大小
 
     // 客户端端点配置
@@ -92,6 +93,7 @@ CLASS ConfigurationManager:
         local_bind_ip: string = "0.0.0.0"     // 本地绑定地址
         local_bind_port: int = 0               // 本地绑定端口 (0=随机)
         connect_timeout_ms: int = 5000         // 连接超时(ms)
+        socket_config: SocketConfig            // 端点级Socket配置 (覆盖全局socket_defaults)
         recv_buf_init_bytes: int = 65536       // 接收缓冲区初始大小
         reconnect: ReconnectConfig             // 重连配置
 
@@ -133,7 +135,7 @@ CLASS ConfigurationManager:
 
         // 步骤3: 分层反序列化
         new_config = std::make_shared<SystemConfig>()
-        ApplyDefaults()   // 先填充默认值
+        // new_config已由SystemConfig各字段的默认值初始化,无需额外调用ApplyDefaults
 
         IF NOT DeserializeLibrary(json_root["library"], new_config->library):
             RETURN false
@@ -166,8 +168,43 @@ CLASS ConfigurationManager:
 
     // 从内存中的JSON字符串加载 (用于单元测试/嵌入式场景)
     FUNCTION LoadFromString(json_string: const std::string&) -> bool:
-        // 流程同LoadFromFile,跳过文件读取步骤
-        // ...
+        // 步骤1: JSON解析
+        json_root = ParseJSON(json_string)
+        IF NOT json_root.has_value():
+            LOG_ERROR("JSON parse error: {}", json_root.error())
+            RETURN false
+
+        // 步骤2: 分层反序列化
+        new_config = std::make_shared<SystemConfig>()
+
+        IF NOT DeserializeLibrary(json_root["library"], new_config->library):
+            RETURN false
+        IF NOT DeserializeSocketDefaults(json_root["socket_defaults"], new_config->socket_defaults):
+            RETURN false
+        IF NOT DeserializeSessionDefaults(json_root["session_defaults"], new_config->session_defaults):
+            RETURN false
+        IF NOT DeserializeServer(json_root["server"], new_config->server):
+            RETURN false
+        IF NOT DeserializeClient(json_root["client"], new_config->client):
+            RETURN false
+        IF NOT DeserializeWorkerPool(json_root["worker_pool"], new_config->worker_pool):
+            RETURN false
+
+        // 步骤3: 语义验证
+        warnings = Validate(new_config)
+        FOR EACH w IN warnings:
+            LOG_WARN("Config validation: {}", w)
+        IF HasBlockingErrors(new_config):
+            LOG_ERROR("Configuration validation failed with blocking errors")
+            RETURN false
+
+        // 步骤4: 环境变量覆盖
+        ApplyEnvOverrides(new_config)
+
+        // 步骤5: 原子替换
+        std::atomic_store(&config_, new_config)
+        LOG_INFO("Configuration loaded successfully from string")
+        RETURN true
 
     // -------------------- 配置读取 --------------------
 
@@ -176,6 +213,10 @@ CLASS ConfigurationManager:
         RETURN std::atomic_load(&config_)
 
     // 便捷访问: 获取库级配置
+    // 实现注意: 调用方必须持GetConfig()返回的shared_ptr以延长生命周期,
+    //          不应在临时shared_ptr上调用此方法 (会导致悬空引用)
+    // 安全用法: auto cfg_handle = config_mgr.GetConfig();
+    //          auto& lib = cfg_handle->library;  // 而非 GetLibraryConfig()
     FUNCTION GetLibraryConfig() -> const LibraryConfig&:
         RETURN GetConfig()->library
 
@@ -263,8 +304,80 @@ CLASS ConfigurationManager:
             out.enable_metrics = json["enable_metrics"].AsBool()
         RETURN true
 
-    // DeserializeServer / DeserializeClient / DeserializeWorkerPool 同理
-    // ...
+    PRIVATE FUNCTION DeserializeServer(json: JsonValue, out: ServerEndpointConfig&) -> bool:
+        IF json IS null: RETURN true
+        IF NOT json.IsObject(): RETURN false
+        IF json.Has("enabled"):
+            out.enabled = json["enabled"].AsBool()
+        IF json.Has("listen_ip"):
+            out.listen_ip = json["listen_ip"].AsString()
+        IF json.Has("listen_port"):
+            out.listen_port = json["listen_port"].AsInt()
+        IF json.Has("address_family"):
+            out.address_family = json["address_family"].AsString()
+        IF json.Has("max_sessions"):
+            out.max_sessions = json["max_sessions"].AsInt()
+        IF json.Has("health_check_interval_ms"):
+            out.health_check_interval_ms = json["health_check_interval_ms"].AsInt()
+        IF json.Has("idle_timeout_ms"):
+            out.idle_timeout_ms = json["idle_timeout_ms"].AsInt()
+        IF json.Has("stale_timeout_ms"):
+            out.stale_timeout_ms = json["stale_timeout_ms"].AsInt()
+        IF json.Has("eviction_policy"):
+            out.eviction_policy = json["eviction_policy"].AsString()
+        IF json.Has("idle_policy"):
+            out.idle_policy = json["idle_policy"].AsString()
+        IF json.Has("recv_buf_init_bytes"):
+            out.recv_buf_init_bytes = json["recv_buf_init_bytes"].AsInt()
+        RETURN true
+
+    PRIVATE FUNCTION DeserializeClient(json: JsonValue, out: ClientEndpointConfig&) -> bool:
+        IF json IS null: RETURN true
+        IF NOT json.IsObject(): RETURN false
+        IF json.Has("enabled"):
+            out.enabled = json["enabled"].AsBool()
+        IF json.Has("remote_ip"):
+            out.remote_ip = json["remote_ip"].AsString()
+        IF json.Has("remote_port"):
+            out.remote_port = json["remote_port"].AsInt()
+        IF json.Has("address_family"):
+            out.address_family = json["address_family"].AsString()
+        IF json.Has("local_bind_ip"):
+            out.local_bind_ip = json["local_bind_ip"].AsString()
+        IF json.Has("local_bind_port"):
+            out.local_bind_port = json["local_bind_port"].AsInt()
+        IF json.Has("connect_timeout_ms"):
+            out.connect_timeout_ms = json["connect_timeout_ms"].AsInt()
+        IF json.Has("recv_buf_init_bytes"):
+            out.recv_buf_init_bytes = json["recv_buf_init_bytes"].AsInt()
+        IF json.Has("reconnect"):
+            DeserializeReconnectConfig(json["reconnect"], out.reconnect)
+        RETURN true
+
+    PRIVATE FUNCTION DeserializeReconnectConfig(json: JsonValue, out: ReconnectConfig&) -> void:
+        IF json IS null: RETURN
+        IF NOT json.IsObject(): RETURN
+        IF json.Has("enabled"):
+            out.enabled = json["enabled"].AsBool()
+        IF json.Has("initial_delay_ms"):
+            out.initial_delay_ms = json["initial_delay_ms"].AsInt()
+        IF json.Has("max_delay_ms"):
+            out.max_delay_ms = json["max_delay_ms"].AsInt()
+        IF json.Has("backoff_factor"):
+            out.backoff_factor = json["backoff_factor"].AsFloat()
+        IF json.Has("max_attempts"):
+            out.max_attempts = json["max_attempts"].AsInt()
+        IF json.Has("jitter_ms"):
+            out.jitter_ms = json["jitter_ms"].AsInt()
+
+    PRIVATE FUNCTION DeserializeWorkerPool(json: JsonValue, out: WorkerPoolConfig&) -> bool:
+        IF json IS null: RETURN true
+        IF NOT json.IsObject(): RETURN false
+        IF json.Has("num_workers"):
+            out.num_workers = json["num_workers"].AsInt()
+        IF json.Has("dispatch_strategy"):
+            out.dispatch_strategy = json["dispatch_strategy"].AsString()
+        RETURN true
 
     // -------------------- 验证 --------------------
 
@@ -344,6 +457,24 @@ CLASS ConfigurationManager:
             path = name.Substring(7)   // 去掉 "NETLIB_" 前缀
             // 解析 path: "LIBRARY_LOG_LEVEL" → section="library", field="log_level"
             ApplyOverrideByPath(config, path, value)
+
+    // -------------------- 命令行覆盖 --------------------
+
+    // 应用命令行参数覆盖 (优先级最高,在LoadFromFile之后调用)
+    // 格式: --section.field=value
+    // 示例: --server.listen_port=9000 --session_defaults.mtu_bytes=1200
+    FUNCTION ApplyCmdLineOverrides(cmdline: ParsedCommandLine) -> void:
+        FOR EACH (key, value) IN cmdline:
+            // 解析路径: "server.listen_port" → section="server", field="listen_port"
+            path = key   // 已去掉 "--" 前缀,由ParseCommandLine处理
+            DOT_POS = path.Find(".")
+            IF DOT_POS == std::string::npos: CONTINUE
+            section = path.Substring(0, DOT_POS)
+            field   = path.Substring(DOT_POS + 1)
+            new_config = std::make_shared<SystemConfig>(*GetConfig())   // 复制当前配置
+            ApplyOverrideBySectionField(new_config.get(), section, field, value)
+            std::atomic_store(&config_, new_config)
+            LOG_INFO("CmdLine override: --{}={}", path, value)
 
     // -------------------- 运行时重载 --------------------
 
@@ -444,6 +575,13 @@ CLASS ConfigurationManager:
         "stale_timeout_ms": 30000,
         "eviction_policy": "immediate",
         "idle_policy": "probe",
+        "socket_config": {
+            "reuse_addr": true,
+            "recv_buf_bytes": 262144,
+            "send_buf_bytes": 262144,
+            "dscp": 0,
+            "ttl": 64
+        },
         "recv_buf_init_bytes": 65536
     },
 
@@ -458,6 +596,13 @@ CLASS ConfigurationManager:
         "local_bind_ip": "0.0.0.0",
         "local_bind_port": 0,
         "connect_timeout_ms": 5000,
+        "socket_config": {
+            "reuse_addr": true,
+            "recv_buf_bytes": 262144,
+            "send_buf_bytes": 262144,
+            "dscp": 0,
+            "ttl": 64
+        },
         "recv_buf_init_bytes": 65536,
 
         // 重连策略 (ReconnectConfig)
