@@ -424,7 +424,7 @@ class CrewMember:
 @dataclass
 class AgentCrew:
     """
-    由 CrewLeader 组件的一支 Agent 团队。
+    由 CrewLeader 组建的一支 Agent 团队。
 
     包含团队标识、任务描述 (mission)、成员列表与执行状态。
     """
@@ -488,9 +488,9 @@ class CrewOrchestrator:
     event_bus: EventBus                 # 事件总线 (发布 Crew 生命周期事件)
 
     # ── 配置 ─────────────────────────────────────────
-    max_parallel: int                   # 最大并行成员数 (默认 4)
-    crew_max_iterations: int            # Crew 级任务分解最大迭代 (默认 3)
-    plan_temperature: float             # 任务分解时的 LLM 温度 (默认 0.4)
+    max_parallel: int                   # 最大并行成员数 (从 Config.crew_max_parallel, 默认 4)
+    crew_max_iterations: int            # Crew 级任务分解最大迭代 (从 Config.crew_max_iterations, 默认 3)
+    plan_temperature: float             # 任务分解时的 LLM 温度 (从 Config.crew_plan_temperature, 默认 0.4)
 
     # ── 构造 ─────────────────────────────────────────
     def __init__(self, agent_registry: AgentRegistry,
@@ -501,7 +501,7 @@ class CrewOrchestrator:
         """
         初始化 CrewOrchestrator。
         - 绑定 AgentRegistry / AgentPool / LLMClient / EventBus
-        - 从 Config 读取 max_parallel / crew_max_iterations / plan_temperature
+        - 从 Config 读取 crew_max_parallel / crew_max_iterations / crew_plan_temperature
         """
 
     # ── Plan: 任务分解与 Agent 匹配 ───────────────────
@@ -575,7 +575,7 @@ class CrewOrchestrator:
 ### 9.3 Crew 事件类型
 
 ```python
-class CrewLifecycleEvent:
+class CrewLifecycleEvent(Enum):
     """
     Crew 生命周期事件 — 发布到 EventBus, 供监控/日志/审计订阅。
 
@@ -588,6 +588,13 @@ class CrewLifecycleEvent:
     - COMPLETED: 全部成员执行完毕且成功
     - FAILED:    存在成员失败且不可恢复
     """
+    PLANNED = "planned"
+    STARTED = "started"
+    MEMBER_STARTED = "member_started"
+    MEMBER_COMPLETED = "member_completed"
+    MEMBER_FAILED = "member_failed"
+    COMPLETED = "completed"
+    FAILED = "failed"
 ```
 
 ### 9.4 Crew 编排流程
@@ -629,4 +636,91 @@ BaseAgent (CrewLeader 角色)
    │     └─ execute_crew()            # 执行 + 聚合
    ├─ agent_registry: AgentRegistry   # 被 CrewOrchestrator 用于匹配 Agent
    └─ agent_pool: AgentPool           # 被 CrewOrchestrator 用于获取实例
+```
+
+### 9.6 CrewTool — Crew 编排的 Tool 适配器
+
+```python
+class CrewTool(BaseTool):
+    """
+    将 BaseAgent.launch_crew() 包装为 Tool, 使得 LLM 可在 ReAct 循环中
+    通过 Function Calling 发起 Crew 编排。
+
+    与 AgentTool (单个 Agent 拉起) 互补:
+    - AgentTool: 拉起单个指定 Agent → Tool 名 = Agent 名
+    - CrewTool:  组建并执行 Agent 团队 → Tool 名固定为 "launch_crew"
+    """
+
+    def __init__(self, agent: BaseAgent) -> None:
+        """
+        初始化 CrewTool。
+
+        参数:
+            agent: 发起 Crew 编排的 Agent 实例 (CrewLeader)。
+                   Tool 执行时将调用 agent.launch_crew()。
+
+        Tool 元数据:
+            name: "launch_crew"
+            description: "组建并执行一个 Agent 团队完成复杂使命。
+                          自动将任务分解为子任务, 匹配最合适的 Agent,
+                          按指定策略 (串行/并行/DAG) 执行, 并汇总结果。"
+            parameters_schema: mission (required), strategy (optional), max_parallel (optional)
+        """
+        self.name = "launch_crew"
+        self.description = (
+            "组建并执行一个 Agent 团队 (Crew) 完成复杂使命。"
+            "自动分解任务 → 匹配最佳 Agent → 按策略执行 → 汇总结果。"
+            "适用场景: 需要多个领域 Agent 协同的复杂任务。"
+        )
+        self.parameters_schema = {
+            "type": "object",
+            "properties": {
+                "mission": {
+                    "type": "string",
+                    "description": "团队使命描述, 说明需要完成什么以及期望的结果"
+                },
+                "strategy": {
+                    "type": "string",
+                    "enum": ["sequential", "parallel", "dag"],
+                    "description": "执行策略: sequential (串行), parallel (并行), dag (依赖拓扑)",
+                    "default": "sequential"
+                },
+                "max_parallel": {
+                    "type": "integer",
+                    "description": "并行模式下最大并发成员数 (默认 4)"
+                }
+            },
+            "required": ["mission"]
+        }
+        self._agent = agent  # CrewLeader 实例
+        self.tags = ["crew", "team", "orchestrate", "coordinate"]
+        self.requires_confirmation = False
+
+    def execute(self, **kwargs) -> ToolResult:
+        """
+        执行 = 发起 Crew 编排:
+        1. 从 kwargs 提取 mission, strategy, max_parallel
+        2. 调用 self._agent.launch_crew(mission, strategy, max_parallel)
+        3. 将 CrewResult 转换为 ToolResult:
+           - success → output = crew_result.mission_summary
+           - failure → error = 失败描述
+        """
+        mission = kwargs["mission"]
+        strategy_str = kwargs.get("strategy", "sequential")
+        strategy = ExecutionStrategy(strategy_str)
+        max_parallel = kwargs.get("max_parallel")
+
+        crew_result = self._agent.launch_crew(
+            mission=mission,
+            strategy=strategy,
+            max_parallel=max_parallel
+        )
+
+        return ToolResult(
+            success=crew_result.success,
+            output=crew_result.mission_summary,
+            data=crew_result,          # 保留完整 CrewResult 供程序使用
+            tool_name=self.name,
+            duration_ms=crew_result.total_duration_ms
+        )
 ```

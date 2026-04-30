@@ -40,7 +40,7 @@
 | 3.2 | 实现 ShellTool (含安全确认) | `agent/tools/shell_tools.py` | 2.3 |
 | 3.3 | 实现 SearchTool + WebTools | `agent/tools/search_tools.py`, `web_tools.py` | 2.3 |
 | 3.4 | 实现 AgentTool 适配器 | `agent/tools/agent_tool.py` | 2.3, 2.6 |
-| 3.4a | 实现 CrewTool 适配器 (launch_crew → Tool) | `agent/tools/crew_tool.py` | 2.3, 2.6a |
+| 3.4a | 实现 CrewTool 适配器 (launch_crew → Tool) | `agent/tools/crew_tool.py` | 2.3, 2.6a, 2.10 |
 | 3.5 | 编写 Tool 层单元测试 (含 CrewTool) | `tests/test_tool_*.py` | 3.1-3.4a |
 
 ### Phase 4: 特化 Agent (预估 2-3 天)
@@ -102,7 +102,7 @@ Phase 3 (内置 Tool)                    │
   ├─ 3.2 ShellTool ← 2.3              │
   ├─ 3.3 SearchTool + WebTools ← 2.3  │
   ├─ 3.4 AgentTool ← 2.3,2.6          │
-  └─ 3.4a CrewTool ← 2.3,2.6a         │
+  └─ 3.4a CrewTool ← 2.3,2.6a,2.10    │
                                        │
 Phase 4 (特化 Agent)                   │
   ├─ 4.1 CodeAgent ← 2.10,3.1-3.3,3.4a│

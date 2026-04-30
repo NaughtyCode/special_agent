@@ -166,7 +166,7 @@ class BaseAgent(ABC):
         """
         将复杂使命分解为子任务并组建 Agent 团队。
 
-        调用 crew_orchestrator.plan_crew():
+        调用 crew_orchestrator.plan_crew(mission, lead_agent_name=self.name):
         1. LLM 分析 mission, 分解为 SubTask 列表
         2. 每个 SubTask 通过 AgentRegistry 匹配最佳特化 Agent
         3. 构建并返回 AgentCrew (status=ASSEMBLED)
@@ -184,9 +184,9 @@ class BaseAgent(ABC):
         流程:
         1. 调用 self.form_crew(mission) 组建团队
         2. 调用 crew_orchestrator.execute_crew(crew, strategy, max_parallel)
+           (execute_crew 内部发布 CrewLifecycleEvent 事件)
         3. 将 CrewResult.mission_summary 写入 ContextStore
-        4. 发布 CrewLifecycleEvent.COMPLETED / FAILED
-        5. 返回聚合后的 CrewResult
+        4. 返回聚合后的 CrewResult
 
         适用场景: 当 LLM 在 ReAct 循环中判断当前任务需多 Agent 协同时,
         通过 Function Calling 调用此方法 (暴露为 launch_crew Tool)。

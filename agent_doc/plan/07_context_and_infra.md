@@ -198,6 +198,11 @@ class Config:
     agent_tool_execution_timeout: float = 30.0  # Tool 执行超时秒 (AGENT_TOOL_TIMEOUT)
     agent_default_name: str = "RootAgent"   # 默认 Agent 名称
 
+    # ── Crew ────────────────────────────────────────
+    crew_max_parallel: int = 4              # Crew 最大并行成员数 (CREW_MAX_PARALLEL)
+    crew_max_iterations: int = 3            # Crew 任务分解最大 LLM 迭代 (CREW_MAX_ITERATIONS)
+    crew_plan_temperature: float = 0.4      # Crew 任务分解时的 LLM 温度 (CREW_PLAN_TEMPERATURE)
+
     # ── 上下文 ──────────────────────────────────────
     context_max_tokens: int = 64000         # 上下文窗口 Token 上限 (CONTEXT_MAX_TOKENS)
     context_compress_strategy: str = "hybrid"  # 压缩策略: sliding | summarize | hybrid
