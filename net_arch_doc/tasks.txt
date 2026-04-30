@@ -1,0 +1,24 @@
+
+-----------------------------------------------
+
+claude --dangerously-skip-permissions
+
+-----------------------------------------------
+
+1. 按 ./net_arch_doc/issues/issue1.txt 的要求执行
+2. 按 ./net_arch_doc/issues/issue2.txt 的要求执行
+3. 按 ./net_arch_doc/issues/issue3.txt 的要求执行
+4. 按 ./net_arch_doc/issues/issue4.txt 的要求执行
+5. 按 ./net_arch_doc/issues/issue5.txt 的要求执行
+6. 按 ./net_arch_doc/issues/issue6.txt 的要求执行
+7. 按 ./net_arch_doc/issues/issue7.txt 的要求执行
+8. 按 ./net_arch_doc/issues/issue8.txt 的要求执行
+9. 按 ./net_arch_doc/issues/issue9.txt 的要求执行
+
+10. 按 ./net_arch_doc/issues/issue10.txt 的要求执行
+11. 按 ./net_arch_doc/issues/issue11.txt 的要求执行
+12. 按 ./net_arch_doc/issues/issue12.txt 的要求执行
+13. 按 ./net_arch_doc/issues/issue13.txt 的要求执行
+14. 按 ./net_arch_doc/issues/issue14.txt 的要求执行
+
+

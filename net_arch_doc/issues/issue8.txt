@@ -1,0 +1,7 @@
+
+前提
+1. 生成完整的修改记录文档,修改记录文档放.\net_arch_doc\changelog目录下
+2. 代码必须加上详细注释
+
+要求
+1. 分析.\net_arch_doc\pseudocodes全部表述，将支持KCP、QUICK的需求加入

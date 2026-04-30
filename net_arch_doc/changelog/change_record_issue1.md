@@ -7,12 +7,12 @@
 | 修改编号 | issue1 |
 | 修改日期 | 2026-04-30 |
 | 修改类型 | 文档生成 — 伪代码与API参考 |
-| 关联文档 | `doc/tech_detail.md` |
+| 关联文档 | `net_arch_doc/tech_detail.md` |
 | 修改人 | SpecialArchAgent |
 
 ## 修改概述
 
-基于 `doc/tech_detail.md` 中描述的"基于C++17的KCP网络库设计思路"，生成完整的伪代码体系和API参考文档。
+基于 `net_arch_doc/tech_detail.md` 中描述的"基于C++17的KCP网络库设计思路"，生成完整的伪代码体系和API参考文档。
 
 ## 文件变更清单
 
@@ -20,12 +20,12 @@
 
 | 序号 | 文件路径 | 文件说明 |
 |------|----------|----------|
-| 1 | `doc/pseudocodes/00_architecture_overview.md` | 架构总览: 四层架构、数据流、线程模型 |
-| 2 | `doc/pseudocodes/01_platform_layer.md` | 平台层伪代码: IOContext, UdpSocket, ThreadPool, TaskQueue, TimerQueue, Message |
-| 3 | `doc/pseudocodes/02_kcp_session.md` | KCP协议层伪代码: KCPSession完整实现、KCP包处理流程、生命周期状态机 |
-| 4 | `doc/pseudocodes/03_kcp_server.md` | 服务端抽象层伪代码: KcpServer, Accept流程, 定时任务 |
-| 5 | `doc/pseudocodes/04_kcp_client.md` | 客户端抽象层伪代码: KcpClient, 连接时序, 重连机制, 使用示例 |
-| 6 | `doc/pseudocodes/05_api_reference.md` | API详细参考: 所有类/函数/参数/返回值的完整文档 |
+| 1 | `net_arch_doc/pseudocodes/00_architecture_overview.md` | 架构总览: 四层架构、数据流、线程模型 |
+| 2 | `net_arch_doc/pseudocodes/01_platform_layer.md` | 平台层伪代码: IOContext, UdpSocket, ThreadPool, TaskQueue, TimerQueue, Message |
+| 3 | `net_arch_doc/pseudocodes/02_kcp_session.md` | KCP协议层伪代码: KCPSession完整实现、KCP包处理流程、生命周期状态机 |
+| 4 | `net_arch_doc/pseudocodes/03_kcp_server.md` | 服务端抽象层伪代码: KcpServer, Accept流程, 定时任务 |
+| 5 | `net_arch_doc/pseudocodes/04_kcp_client.md` | 客户端抽象层伪代码: KcpClient, 连接时序, 重连机制, 使用示例 |
+| 6 | `net_arch_doc/pseudocodes/05_api_reference.md` | API详细参考: 所有类/函数/参数/返回值的完整文档 |
 | 7 | `changelog/change_record_issue1.md` | 本修改记录文件 |
 
 ### 修改文件
