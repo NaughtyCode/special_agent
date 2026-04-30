@@ -2,7 +2,7 @@
 
 ## 1. 设计目标
 
-构建一个 **易用、高性能、跨平台、支持CS与P2P架构** 的网络库，以可替换传输协议为核心，提供低延迟、高可靠的传输能力，同时通过分层参数化配置适配从实时游戏到IoT数据上报等多种场景。
+构建一个 **易用、高性能、跨平台、支持CS与P2P架构** 的网络库，以可替换传输协议为核心，提供低延迟、高可靠的传输能力，同时通过 JSON 配置文件 + 分层参数化配置体系适配从实时游戏到IoT数据上报等多种场景。系统启动时读取 JSON 配置文件初始化全库参数,支持环境变量和命令行覆盖。
 
 ## 2. 分层架构 (可替换层次设计)
 
@@ -42,22 +42,51 @@
 // ============================================================
 
 // --------------------------------------------------
-// 3.1 库初始化与全局配置
+// 3.1 库初始化与全局配置 (基于JSON配置文件)
 // --------------------------------------------------
-FUNCTION LibraryInitialize(config: LibraryConfig):
-    // 全局配置: 日志级别、内存分配器、平台选择策略等
-    // 所有层级的默认参数均可在此统一指定,逐层覆盖
-    LibraryConfig DEFAULT:
-        .io_backend            = AUTO_DETECT         // 自动选择最优IO模型
-        .default_mtu            = 1400               // 默认MTU,可按链路调整
-        .default_send_window    = 128                // 默认发送窗口(包数)
-        .default_recv_window    = 128                // 默认接收窗口(包数)
-        .default_update_tick_ms = 10                 // 默认驱动时钟周期
-        .default_timeout_ms     = 30000              // 默认超时阈值
-        .socket_rcvbuf_bytes    = 256 * 1024         // Socket接收缓冲
-        .socket_sndbuf_bytes    = 256 * 1024         // Socket发送缓冲
-        .max_worker_threads     = HARDWARE_CONCURRENCY  // 最大工作线程数
-        .enable_metrics         = true               // 是否启用指标收集
+FUNCTION LibraryInitialize(config_file_path: string = "netlib_config.json"):
+    // 步骤1: 创建ConfigurationManager并加载JSON配置文件
+    //        配置来源优先级: 内置默认值 → JSON文件 → 环境变量 → 命令行
+    config_mgr = ConfigurationManager()
+    IF NOT config_mgr.LoadFromFile(config_file_path):
+        LOG_FATAL("Failed to load configuration from {}", config_file_path)
+        RETURN false
+
+    // 步骤2: 应用命令行覆盖 (最高优先级)
+    //        如: ./server --server.listen_port=9000 --session_defaults.mtu_bytes=1200
+    config_mgr.ApplyCmdLineOverrides(ParseCommandLine())
+
+    // 步骤3: 获取最终配置快照 (线程安全,不可变)
+    config = config_mgr.GetConfig()
+
+    // 步骤4: 根据配置创建IO后端 (自动检测或显式指定)
+    //        config->library.io_backend: "auto"/"epoll"/"iocp"/"kqueue"/"poll"
+    event_loop = EventLoop(ParseIOBackend(config->library.io_backend))
+
+    // 步骤5: 创建WorkerPool (如配置多线程模式)
+    //        config->worker_pool.num_workers: 0=硬件并发数
+    IF config->worker_pool.num_workers > 1 OR config->worker_pool.num_workers == 0:
+        worker_pool = WorkerPool(
+            config->worker_pool.num_workers,
+            ParseDispatchStrategy(config->worker_pool.dispatch_strategy)
+        )
+
+    // 步骤6: 注册运行时配置重载 (SIGHUP或管理接口触发)
+    //        仅修改可热更新的参数 (日志级别/超时阈值等)
+    //        io_backend/端口等需重启生效
+    SignalHandler::OnSIGHUP([&config_mgr]():
+        config_mgr.Reload(config_file_path)
+    )
+
+    // 配置覆盖示例 — 各层参数均可被JSON/环境变量/命令行覆盖:
+    //   library.io_backend             = "auto" / "epoll" / "iocp" / "kqueue" / "poll"
+    //   library.default_engine_type     = "kcp" / "quic"
+    //   library.log_level              = "trace" / "debug" / "info" / "warn" / "error"
+    //   session_defaults.mtu_bytes     = 500~9000 (默认1400)
+    //   session_defaults.send_window   = 4~1024 (默认128)
+    //   server.max_sessions            = 0~UINT32_MAX (0=不限制)
+    //   socket_defaults.recv_buf_bytes = 4096~INT_MAX (默认256KB)
+    //   worker_pool.num_workers        = 0~512 (0=硬件并发数)
 
 // --------------------------------------------------
 // 3.2 服务端启动流程 (泛化)
@@ -239,6 +268,11 @@ FUNCTION ConfigureProtocol(session, profile: ProtocolProfile):
 
 ```
                     ┌──────────────────┐
+                    │ ConfigurationMgr │ ← 启动时加载JSON配置
+                    │ (系统配置管理器)  │
+                    └────────┬─────────┘
+                             │ 初始化时注入各层配置
+                    ┌────────┴─────────┐
                     │   Application     │
                     └────────┬─────────┘
                              │ 仅依赖公开接口
@@ -265,11 +299,13 @@ FUNCTION ConfigureProtocol(session, profile: ProtocolProfile):
    └──────────┘  └──────────────┘  └──────────────┘
 
    关键扩展点:
+   0. ConfigurationMgr — 从JSON文件加载全库配置,支持环境变量/命令行覆盖和热重载
    1. Protocol Engine  — 实现统一接口即可替换为任意可靠传输协议 (内置KCP和QUIC两种实现)
    2. DatagramSocket   — 适配UDPLite/RAW Socket/模拟测试层
    3. TaskQueue        — 可替换为无锁MPSC队列/优先级队列/有界队列
    4. TimerService     — 可替换为高精度定时器/分层时间轮
    5. IOBackend        — 可替换为epoll(Linux/Android)/IOCP(Windows)/kqueue(macOS/BSD/iOS)/poll(回退)
+   6. JSON Parser      — 可替换为nlohmann/json / simdjson / rapidjson (配置解析层)
 ```
 
 ## 5. 线程模型 (多策略可配置)

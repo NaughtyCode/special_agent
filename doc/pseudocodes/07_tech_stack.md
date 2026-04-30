@@ -144,10 +144,60 @@
 | **接收缓冲** | `std::vector<uint8_t>` (动态扩容) | — |
 | **消息封装** | `Message` 类 (持 `std::vector<uint8_t>` + 元数据) | — |
 | **定时器延迟删除** | `std::unordered_set<TimerHandle>` 标记取消 + 惰性清理 | — |
+| **配置存储** | `ConfigurationManager` + `SystemConfig` (JSON → 类型化结构体) | 支持 JSON/TOML/YAML 解析器替换 |
 
 ---
 
-## 7. 设计模式
+## 7. 配置体系
+
+### 7.1 配置分级
+
+```
+SystemConfig (根)
+  ├── LibraryConfig (库级全局)
+  │     ├── io_backend / default_engine_type
+  │     ├── log_level / log_output / metrics_output
+  │     └── max_worker_threads / enable_metrics
+  ├── SocketConfig (Socket 默认配置)
+  │     └── reuse_addr / recv_buf_bytes / send_buf_bytes / dscp / ttl
+  ├── SessionDefaultsConfig (Session 默认配置)
+  │     ├── engine_type / profile
+  │     └── 全部协议参数 (MTU/窗口/nodelay/流控等)
+  ├── ServerEndpointConfig (Server 端点)
+  │     ├── listen_ip / listen_port / max_sessions
+  │     ├── 健康检测与驱逐策略参数
+  │     └── idle_policy / eviction_policy
+  ├── ClientEndpointConfig (Client 端点)
+  │     ├── remote_ip / remote_port / connect_timeout_ms
+  │     └── ReconnectConfig (重连策略)
+  └── WorkerPoolConfig (线程池)
+        └── num_workers / dispatch_strategy
+```
+
+### 7.2 配置来源优先级 (从低到高)
+
+```
+1. 代码内置默认值
+      ↓ (JSON 覆盖)
+2. netlib_config.json 配置文件
+      ↓ (环境变量覆盖)
+3. NETLIB_<SECTION>_<FIELD> 环境变量
+      ↓ (命令行覆盖)
+4. --section.field=value 命令行参数 (最高)
+```
+
+### 7.3 配置热更新分类
+
+| 分类 | 生效时机 | 字段示例 |
+|------|---------|---------|
+| **即时生效** | 立即应用 | `log_level`, `enable_metrics` |
+| **周期性生效** | 下个检测周期 | `health_check_interval_ms`, `idle_timeout_ms` |
+| **新建Session生效** | 此后创建的 Session | `session_defaults.*`, `socket_defaults.*` |
+| **需重启生效** | 进程重启后 | `io_backend`, `listen_port`, `num_workers` |
+
+---
+
+## 8. 设计模式
 
 | 模式 | 应用位置 | 说明 |
 |------|---------|------|
@@ -161,10 +211,13 @@
 | **幂等设计** | `Close()` / `Stop()` / `Cancel()` | 重复调用安全,终态不可逆 |
 | **延迟删除** | `TimerQueue::Cancel()` / `EventLoop::CancelTimer()` | 标记取消 + 惰性清理,避免回调中删除自身的 ABA 问题 |
 | **批量消费** | `TaskQueue::ExecuteAll()` / `Server::RunHealthCheck()` | swap 到本地后锁外执行,减少锁竞争 |
+| **快照不可变** | `ConfigurationManager::GetConfig()` 返回 `shared_ptr<const>` | 多线程读配置无需锁,原子交换指针 |
+| **分层反序列化** | `ConfigurationManager::DeserializeLibrary/Server/Client/...` | 逐 Section 反序列化,未出现的 key 保留默认值 |
+| **环境注入** | `ApplyEnvOverrides` / `ApplyCmdLineOverrides` | 外部环境注入配置,实现 12-factor app 原则 |
 
 ---
 
-## 8. 构建与测试工具链
+## 9. 构建与测试工具链
 
 ### 编译器与构建
 
@@ -212,7 +265,7 @@
 
 ---
 
-## 9. 外部依赖
+## 10. 外部依赖
 
 | 依赖 | 用途 | 备注 |
 |------|------|------|
@@ -221,35 +274,24 @@
 | **POSIX Socket API** | 跨平台网络 IO | Linux/Android/macOS/BSD/iOS 原生,Windows 通过 IOCP 适配 |
 | **C++ 标准库** | 容器/线程/原子/智能指针/函数对象 | STL containers, threading, atomics, type traits |
 | **第三方 polyfill (可选)** | 弥补 C++17 与 C++20/23 差距 | `tl::expected` / `fu2::unique_function` / `gsl::span` |
+| **JSON 解析库** | JSON 配置文件解析 | 推荐 `nlohmann/json` (header-only, C++17 友好) 或 `simdjson` (高性能,零拷贝解析) |
 
 ---
 
-## 10. 库级全局配置
+## 11. 库级全局配置与配置体系分层
+
+系统配置通过 `ConfigurationManager` 集中管理,从 JSON 文件加载并分发到各层。详见 `08_system_config.md`。
 
 ```
-struct LibraryConfig {
-    IOBackend io_backend = IOBackend::kAutoDetect;  // IO 后端选择
-    bool enable_metrics = true;                      // 全局指标收集开关
-    // 预留: 日志级别 / 内存分配器 / 断言处理器
-};
-```
+// 配置来源优先级 (低 → 高):
+//   内置默认值 → JSON文件 → 环境变量(NETLIB_*) → 命令行(--section.field=value)
 
----
-
-## 附录: 配置体系分层
-
-```
-LibraryConfig (库级全局)
-  ├── ServerConfig (服务端)
-  │     ├── Session::Config (会话协议)
-  │     ├── EvictionPolicy (驱逐策略)
-  │     ├── IdlePolicy (空闲策略)
-  │     └── SocketConfig (Socket 选项)
-  ├── ClientConfig (客户端)
-  │     ├── Session::Config (会话协议)
-  │     ├── ReconnectStrategy (重连策略)
-  │     └── SocketConfig (Socket 选项)
-  └── Session::Config (独立会话)
-        ├── ProtocolProfile (协议预设)
-        └── 逐参数覆盖 (MTU/窗口/nodelay/流控...)
+// 配置分层结构:
+SystemConfig
+  ├── LibraryConfig           // io_backend / engine_type / log_level / max_workers
+  ├── SocketConfig             // reuse_addr / buffer sizes / dscp / ttl
+  ├── SessionDefaultsConfig    // 协议参数模板 (MTU/窗口/nodelay/流控)
+  ├── ServerEndpointConfig     // 监听地址 / 健康检测 / 驱逐策略
+  ├── ClientEndpointConfig     // 目标地址 / 重连策略 / 连接超时
+  └── WorkerPoolConfig         // 线程数 / 分配策略
 ```
