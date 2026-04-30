@@ -50,8 +50,14 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
         kBalancedMode   // 平衡模式 (通用RPC/消息推送)
         kCustom         // 用户逐参数自定义
 
+    ENUM EngineType:
+        kEngineKCP  = 0   // KCP协议引擎 (默认,轻量级可靠UDP)
+        kEngineQUIC = 1   // QUIC协议引擎 (内置TLS 1.3加密,支持连接迁移/0-RTT/多路复用)
+
     // -------------------- 配置结构 --------------------
     STRUCT Config:
+        // 协议引擎选择 (决定ProtocolEngineFactory创建哪个引擎实例)
+        engine_type: EngineType = EngineType::kEngineKCP
         // 协议预设 (选择预设后自动填充下列4项,也可在kCustom下逐项设置)
         profile: ProtocolProfile = ProtocolProfile::kFastMode
         nodelay: int = 1                 // 0=普通模式(RTO翻倍), 1=快速模式(RTO×1.5)
@@ -106,7 +112,7 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
         last_recv_time_ms_ = Clock::NowMs()
         recv_buffer_.resize(config_.rx_buffer_init_bytes)
 
-        // 创建协议引擎 (可注入: KCP / 自定义 / Mock)
+        // 创建协议引擎 (可注入: KCP / QUIC / 自定义 / Mock)
         engine_ = ProtocolEngineFactory::Create(config_)
 
         // 注册引擎输出回调: 引擎产生的底层数据包 → Socket发出
@@ -325,6 +331,9 @@ FUNCTION SendPipeline(session: Session, user_data: span<const uint8_t>):
     //   以KCP为例: 头部24字节 =
     //     conv(4) + cmd(1) + frag(1) + wnd(2) +
     //     ts(4) + sn(4) + una(4) + len(4)
+    //   以QUIC为例: 头部1-20字节 (短头1字节,长头最多20字节) =
+    //     HeaderForm(1) + FixedBit(1) + SpinBit(1) + ReservedBits(2) +
+    //     ConnectionID(可变) + PacketNumber(可变) + Payload
     // 步骤4: 分段加入发送队列
     // 步骤5: Update()时:
     //   a. 检查发送窗口 → 窗口内分段通过OutputCallback输出
@@ -348,10 +357,12 @@ FUNCTION RecvPipeline(session: Session, raw_datagram: span<const uint8_t>):
     //   如有 → 组装返回 → 触发OnMessage回调
 
 // --------------------------------------------------
-// 2.3 协议头解析 (以KCP为例,Engine可替换)
+// 2.3 协议头解析 (以KCP和QUIC为例,Engine可替换)
 // --------------------------------------------------
-FUNCTION ParseHeader(data: span<const uint8_t>) -> std::optional<Header>:
-    MIN_HEADER_SIZE = 24  // 此值由协议引擎类型决定,此处以KCP为例
+FUNCTION ParseHeader(data: span<const uint8_t>, engine_type: EngineType) -> std::optional<Header>:
+    // 最小头部大小由协议引擎类型决定:
+    //   KCP:  MIN_HEADER_SIZE = 24 字节 (conv+cmd+frag+wnd+ts+sn+una+len)
+    //   QUIC: MIN_HEADER_SIZE = 1  字节 (短头HeaderForm,不含CID和PacketNumber)
     IF data.size() < MIN_HEADER_SIZE:
         RETURN std::nullopt
 

@@ -59,12 +59,20 @@ enum class ProtocolProfile {
     kBalancedMode,  // 平衡模式 (通用RPC/消息推送)
     kCustom         // 用户逐参数自定义 (所有字段需手动设置)
 };
+
+enum class EngineType {
+    kEngineKCP  = 0,  // KCP协议引擎 (默认,轻量级可靠UDP,无内置加密)
+    kEngineQUIC = 1   // QUIC协议引擎 (基于UDP,内置TLS 1.3加密,支持连接迁移/0-RTT/多路复用)
+};
 ```
 
 ### 1.3 配置结构
 
 ```
 struct Session::Config {
+    // === 协议引擎选择 ===
+    EngineType engine_type = EngineType::kEngineKCP;  // 默认使用KCP引擎, 可选kEngineQUIC
+
     // === 协议预设 (选择后自动填充下列4项) ===
     ProtocolProfile profile = ProtocolProfile::kFastMode;
 
@@ -154,7 +162,7 @@ void SendHandshakePacket()
 
 void SendProbePacket()
 // 返回值: void
-// 说明: 发送协议层探活包 (如KCP的WASK命令字),对端自动回复确认
+// 说明: 发送协议层探活包 (如KCP的WASK命令字 / QUIC的PING帧),对端自动回复确认
 //       此方法通常由Server在空闲检测时调用,或由应用层在需要主动
 //       检测连接存活时调用 (如: 长时间无业务数据后主动探活)
 ```
@@ -907,7 +915,8 @@ public:
 // ============================================================
 // 描述: 协议引擎抽象接口 — 实现此接口即可替换底层传输协议
 //       默认实现: KCP (ikcp_* C API封装)
-//       可替换为: 自定义可靠UDP / QUIC-like / Mock引擎 (测试用)
+//       第二实现: QUIC (基于UDP的多路复用安全传输,内置TLS 1.3加密)
+//       可替换为: 自定义可靠UDP / Mock引擎 (测试用)
 // ============================================================
 
 // 解析结果: 引擎Input()的返回值
@@ -970,10 +979,14 @@ CLASS ProtocolEngine:
     // -------------------- 协议命令包 --------------------
 
     VIRTUAL FUNCTION SendHandshake() -> void = 0
-    // 发送握手首包 (如KCP的空数据包或SYN-like命令)
+    // 发送握手首包:
+    //   KCP: 空数据包 (用于触发服务端隐式Accept)
+    //   QUIC: Initial包 (包含TLS 1.3 ClientHello, 触发加密握手)
 
     VIRTUAL FUNCTION SendProbe() -> void = 0
-    // 发送探活包 (如KCP的WASK),对端收到后自动回复
+    // 发送探活包:
+    //   KCP: WASK命令字 (对端自动回复WINS)
+    //   QUIC: PING帧 (对端自动回复PONG或携带数据的ACK)
 
     VIRTUAL FUNCTION NotifyClose() -> void = 0
     // 构建并发送关闭通知包
@@ -996,7 +1009,9 @@ CLASS ProtocolEngine:
 // 工厂函数
 namespace ProtocolEngineFactory {
     std::unique_ptr<ProtocolEngine> Create(Session::Config config);
-    // 默认: 创建KCP引擎实例 (封装ikcp_create/ikcp_setoutput/ikcp_nodelay/ikcp_wndsize等)
+    // 根据Config中的engine_type字段选择协议引擎:
+    //   kEngineKCP  → 创建KCP引擎实例 (封装ikcp_create/ikcp_setoutput/ikcp_nodelay/ikcp_wndsize等)
+    //   kEngineQUIC → 创建QUIC引擎实例 (封装TLS 1.3握手/流控/连接迁移等)
     // 扩展: 可通过注册自定义工厂函数来支持其他协议引擎实现
     // 用法: 在库初始化时调用 RegisterFactory("my_protocol", myFactoryFunction)
 }

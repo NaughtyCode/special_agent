@@ -70,10 +70,27 @@
 
 | 层级 | 选型 | 说明 |
 |------|------|------|
-| **默认协议引擎** | KCP | 通过 `ikcp_*` C API 封装 (`ikcp_create` / `ikcp_setoutput` / `ikcp_nodelay` / `ikcp_wndsize`) |
-| **协议引擎接口** | ProtocolEngine (抽象接口) | 可替换为任意可靠传输协议实现 (自定义可靠UDP / QUIC-like / Mock) |
-| **工厂注册** | ProtocolEngineFactory | 支持运行时注册自定义协议引擎工厂函数 |
+| **默认协议引擎** | KCP | 通过 `ikcp_*` C API 封装 (`ikcp_create` / `ikcp_setoutput` / `ikcp_nodelay` / `ikcp_wndsize`);轻量级可靠UDP,适合低延迟游戏场景 |
+| **第二协议引擎** | QUIC | 基于 UDP 的多路复用安全传输协议;内置 TLS 1.3 加密;支持 0-RTT 握手、连接迁移 (IP 切换不断连)、无队头阻塞的多流复用 |
+| **协议引擎接口** | ProtocolEngine (抽象接口) | 可替换为任意可靠传输协议实现 (自定义可靠UDP / Mock 等) |
+| **引擎选择** | `Session::Config::engine_type` | `kEngineKCP` (0,默认) / `kEngineQUIC` (1),构造时通过 `ProtocolEngineFactory::Create()` 创建对应引擎 |
+| **工厂注册** | ProtocolEngineFactory | 支持运行时注册自定义协议引擎工厂函数 (`RegisterFactory`) |
 | **协议预设** | Fast / Reliable / Balanced / Custom | 通过 `Session::Config::FromProfile()` 工厂方法生成 |
+
+### KCP vs QUIC 选型指南
+
+| 维度 | KCP | QUIC |
+|------|-----|------|
+| **传输层** | 基于 UDP,自定义可靠性 | 基于 UDP,IETF 标准 (RFC 9000) |
+| **加密** | 无内置加密 (需应用层自行加密) | 强制 TLS 1.3 加密 (防窃听/篡改) |
+| **握手延迟** | 0-RTT (无握手,首包即创建会话) | 0-RTT / 1-RTT (0-RTT 需预共享密钥) |
+| **多路复用** | 单流 (不区分流ID) | 多流 (Stream ID 隔离,无队头阻塞) |
+| **连接迁移** | 不支持 (IP 变更需重新握手) | 支持 (Connection ID 不变,IP 切换自动恢复) |
+| **拥塞控制** | 固定窗口 (可配置) | 可插拔拥塞算法 (NewReno / Cubic / BBR) |
+| **头部开销** | 24 字节 (固定) | 1-20 字节 (短头 1 字节,长头最多 20 字节) |
+| **实现复杂度** | 低 (~2000 行 C) | 高 (需 TLS 库集成,~数万行) |
+| **适用场景** | 局域网/私有网游戏,低延迟优先 | 公网/移动端游戏,需要安全加密和连接迁移 |
+| **外部依赖** | 仅 ikcp.c/ikcp.h (无其他依赖) | TLS 库 (如 BoringSSL / OpenSSL / PicoTLS) |
 
 ### 协议配置参数
 
@@ -199,7 +216,8 @@
 
 | 依赖 | 用途 | 备注 |
 |------|------|------|
-| **KCP (ikcp.c/ikcp.h)** | 默认协议引擎实现 | C API,通过 `ProtocolEngine` 接口封装;可替换 |
+| **KCP (ikcp.c/ikcp.h)** | 默认协议引擎 (kEngineKCP) | C API,通过 `ProtocolEngine` 接口封装;轻量级,无额外依赖 |
+| **QUIC 库 (可选)** | 第二协议引擎 (kEngineQUIC) | 需集成 TLS 库;如 BoringSSL (推荐)/OpenSSL (Linux/Android)/PicoTLS (嵌入式)/SecureTransport (iOS/macOS 原生) |
 | **POSIX Socket API** | 跨平台网络 IO | Linux/Android/macOS/BSD/iOS 原生,Windows 通过 IOCP 适配 |
 | **C++ 标准库** | 容器/线程/原子/智能指针/函数对象 | STL containers, threading, atomics, type traits |
 | **第三方 polyfill (可选)** | 弥补 C++17 与 C++20/23 差距 | `tl::expected` / `fu2::unique_function` / `gsl::span` |
