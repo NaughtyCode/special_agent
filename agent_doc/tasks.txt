@@ -9,6 +9,7 @@ claude --dangerously-skip-permissions
 2. 按 ./agent_doc/issues/issue2.txt 的要求执行
 3. 按 ./agent_doc/issues/issue3.txt 的要求执行
 4. 按 ./agent_doc/issues/issue4.txt 的要求执行
+5. 按 ./agent_doc/issues/issue5.txt 的要求执行
 
 
 

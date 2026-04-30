@@ -175,7 +175,7 @@ class BaseAgent(ABC):
         """校验状态转移合法性。"""
 
     def _record_error(self, error: Exception, context: str) -> None:
-        """记录错误并发布 ErrorEvent。"""
+        """记录错误并发布 AgentLifecycleEvent.ERROR。"""
 ```
 
 ### 2.4 AgentState 状态机

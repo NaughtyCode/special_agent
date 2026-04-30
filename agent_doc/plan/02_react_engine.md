@@ -129,10 +129,10 @@ class ReActEngine:
         """
 
     def _check_termination(self, parsed: ParsedReAct,
-                           iteration: int) -> TerminationDecision | None:
+                           iteration: int) -> FinishReason | None:
         """
         检查是否应终止循环。
-        返回 TerminationDecision 或 None (继续循环)。
+        返回 FinishReason 或 None (继续循环)。
         """
 ```
 

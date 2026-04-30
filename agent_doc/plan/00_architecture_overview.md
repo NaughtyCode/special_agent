@@ -82,7 +82,7 @@
 │   │      │   ├─ Strategy.ExactMatch → 精确名称匹配      │
 │   │      │   ├─ Strategy.FuzzyMatch → 模糊匹配          │
 │   │      │   ├─ Strategy.SemanticMatch → 语义匹配       │
-│   │      │   └─ Strategy.FunctionCall → 原生 FC 模式    │
+│   │      │   └─ Strategy.AgentMatch → Agent 匹配        │
 │   │      │                                             │
 │   │      ├─ 匹配到普通 Tool → 执行 Tool                 │
 │   │      ├─ 匹配到特化 Agent → 拉起 Agent               │

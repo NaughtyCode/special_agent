@@ -232,7 +232,8 @@ class MyDomainAgent(BaseAgent):
         self.tool_manager.register(ReadFileTool())
         self.tool_manager.register(WriteFileTool())
 
-    def __init__(self, config=None, agent_config=None):
+    def __init__(self, config: Config | None = None,
+                 agent_config: AgentConfig | None = None):
         if agent_config is None:
             agent_config = AgentConfig(
                 max_iterations=15,           # 领域任务可能需要更多迭代
