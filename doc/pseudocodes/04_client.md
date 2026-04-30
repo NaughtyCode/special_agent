@@ -190,8 +190,8 @@ CLASS Client:
             session_->Close()
             session_.reset()
 
-        // 延迟后重试
-        event_loop_.AddTimer(delay, [this]():
+        // 延迟后重试 (将定时器句柄存储为成员以防止Client析构时悬空回调)
+        retry_timer_ = event_loop_.AddTimer(delay, [this]():
             IF state_ == ClientState::kReconnecting:
                 state_ = ClientState::kConnecting
                 DoConnect()
@@ -208,6 +208,10 @@ CLASS Client:
         // 取消连接超时定时器 (生命周期安全: 防止悬空指针回调)
         IF connect_timer_.IsValid():
             event_loop_.CancelTimer(connect_timer_)
+
+        // 取消重连延迟定时器 (防止Client析构后回调触发)
+        IF retry_timer_.IsValid():
+            event_loop_.CancelTimer(retry_timer_)
 
         // 清除重连配置以停止重连循环
         config_.reconnect.reset()
@@ -286,17 +290,23 @@ CLASS Client:
 
     PRIVATE FUNCTION WireSessionEvents(session: std::shared_ptr<Session>) -> void:
         // 注册Session错误回调: 将协议/Socket错误传播到重连逻辑
+        // 关键: 在调用session_->Close()前设置state_=kReconnecting,
+        //       防止OnError触发Close→OnStateChange再次触发重连(双重连问题)
+        //       同时确保后续OnServerFirstResponse能找到正确的状态
         session->OnError([this](SessionError e):
             IF state_ == ClientState::kConnected:
                 // 已建立的连接断开 → 尝试重连
                 IF config_.reconnect.has_value():
-                    // 清理当前Session并进入重连流程
+                    // 先标记状态 再清理Session (顺序关键: OnStateChange检查state_!=kConnected时跳过)
+                    state_ = ClientState::kReconnecting
                     IF session_:
                         session_->Close()
                         session_.reset()
                     // 通过PostTask异步发起重连(避免在Session回调中修改自身状态)
+                    retry_count_ = 0  // 复位重试计数 (新连接序列)
                     event_loop_.PostTask([this]():
-                        DoConnect()   // 直接创建新Session并发起连接
+                        state_ = ClientState::kConnecting
+                        DoConnect()
                     )
                 ELSE:
                     NotifyConnectFailure(ConnectError::kSocketError)
@@ -305,12 +315,16 @@ CLASS Client:
         // 注册Session状态变更回调
         session->OnStateChange([this](SessionState old_state, SessionState new_state):
             IF new_state == SessionState::kClosed:
+                // 仅当Client仍处于kConnected时触发重连 (避免与OnError重复)
+                // 若OnError已设置kReconnecting, 此处跳过
                 IF state_ == ClientState::kConnected:
                     // 已建立的连接被关闭 (超时/被服务器关闭/协议错误)
                     // 尝试重连或通告失败,与OnError路径保持一致
                     IF config_.reconnect.has_value():
                         state_ = ClientState::kReconnecting
+                        retry_count_ = 0
                         event_loop_.PostTask([this]():
+                            state_ = ClientState::kConnecting
                             DoConnect()
                         )
                     ELSE:
@@ -338,6 +352,7 @@ CLASS Client:
     PRIVATE MEMBER conv_: uint32_t = 0                         // 当前会话的routing_key
     PRIVATE MEMBER routing_key_counter_: uint64_t              // 单调递增的routing_key分配器
     PRIVATE MEMBER connect_timer_: TimerHandle                 // 连接超时定时器句柄
+    PRIVATE MEMBER retry_timer_: TimerHandle                   // 重连延迟定时器句柄 (Disconnect中取消以防止悬空)
     PRIVATE MEMBER success_handler_: ConnectSuccessHandler
     PRIVATE MEMBER failure_handler_: ConnectFailureHandler
     PRIVATE MEMBER retry_count_: uint32_t = 0

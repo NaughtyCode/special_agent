@@ -520,6 +520,14 @@ enum class IOMask : uint8_t {
     kError         = 0x04,  // 错误事件
     kEdgeTriggered = 0x10   // 边缘触发 (推荐用于高性能场景)
 };
+// 位标志运算符: C++ scoped enum不支持隐式转换为整型进行位运算,
+// 必须显式重载operator|/operator&等以支持 kReadable | kEdgeTriggered 语法
+constexpr IOMask operator|(IOMask a, IOMask b):
+    RETURN static_cast<IOMask>(static_cast<uint8_t>(a) | static_cast<uint8_t>(b))
+constexpr IOMask operator&(IOMask a, IOMask b):
+    RETURN static_cast<IOMask>(static_cast<uint8_t>(a) & static_cast<uint8_t>(b))
+constexpr bool HasFlag(IOMask mask, IOMask flag):
+    RETURN (static_cast<uint8_t>(mask) & static_cast<uint8_t>(flag)) != 0
 
 struct EventDesc {
     uintptr_t fd_or_handle;      // 文件描述符 (POSIX) 或句柄 (Windows)
@@ -911,11 +919,12 @@ static void SetLogCallback(LogCallback cb)
 //         c. 抛出异常 (会被捕获并忽略,但日志消息丢失)
 
 static std::optional<LogCallback> GetLogCallback()
-// 返回值: 当前注册的回调副本; std::nullopt表示未设置回调
-// 说明: 返回的是回调的值副本 (std::move_only_function不可拷贝,以optional包装);
-//       调用方获得独立的回调副本,可在锁外安全调用;
-//       该副本的生命周期与LogManager内部状态解耦,不存在悬空指针风险
-// 注意: 此接口用于检查/包装已有回调; 频繁调用会产生move_only_function的移动开销
+// 返回值: 注意: LogCallback = std::move_only_function, 不可拷贝;
+//       返回move会清空内部回调 (导致日志停止工作)。
+//       若需此功能, 推荐改用 std::function 作为LogCallback类型 (可拷贝),
+//       或返回 std::shared_ptr<LogCallback> 以避免移动开销和副作用。
+// 说明: 当前设计保留此接口用于调试/检查, 但不推荐频繁调用;
+//       频繁检查应使用 IsLevelEnabled() 进行级别过滤
 
 static void SetLevel(Level level)
 // 参数: level — [in] 最低输出级别,默认kInfo

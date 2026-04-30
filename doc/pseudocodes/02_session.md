@@ -61,7 +61,7 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
         // 协议预设 (选择预设后自动填充下列4项,也可在kCustom下逐项设置)
         profile: ProtocolProfile = ProtocolProfile::kFastMode
         nodelay: int = 1                 // 0=普通模式(RTO翻倍), 1=快速模式(RTO×1.5)
-        update_interval_ms: int = 10     // 协议内部时钟周期(ms)
+        update_interval_ms: uint32_t = 10  // 协议内部时钟周期(ms), 无符号防止负数传入导致定时器未定义行为
         fast_resend_threshold: int = 2   // 快速重传触发阈值(ACK跳过次数)
         flow_control_enabled: bool = false  // 是否启用拥塞流控
         // 以下字段对所有Profile生效,可独立覆盖:
@@ -85,6 +85,10 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
                 CASE kReliableMode:
                     config.nodelay = 0
                     config.update_interval_ms = 100
+                    // fast_resend_threshold=0 禁用快速重传, 仅依赖RTO超时重传;
+                    // 优点是带宽利用率高 (不因重复ACK触发不必要的重传),
+                    // 缺点是单次丢包的恢复延迟较大 (需等待RTO到期: nodelay=0时RTO翻倍)
+                    // 适合带宽敏感场景 (文件传输/数据同步) 而非实时交互场景
                     config.fast_resend_threshold = 0
                     config.flow_control_enabled = true
                 CASE kBalancedMode:
@@ -168,10 +172,19 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
                  conv_, timeout_ms)
         TransitionState(kClosing)
         engine_.SendShutdownNotification()
-        shutdown_timer_ = event_loop_.AddTimer(timeout_ms, [this]():
-            IF state_ == kClosing:
-                Close()
+        // 使用weak_ptr捕获避免悬空指针: Session可能在定时器触发前被外部Close析构,
+        // 此时weak_ptr.lock()返回nullptr, 安全跳过; raw this在Session销毁后悬空导致use-after-free
+        shutdown_timer_ = event_loop_.AddTimer(timeout_ms, [weak_self = weak_from_this()]():
+            IF auto self = weak_self.lock():
+                IF self->state_ == SessionState::kClosing:
+                    self->Close()
+            // weak_ptr已过期: Session在定时器触发前被销毁, 无需执行任何操作
         )
+        // 检查定时器分配是否成功: AddTimer可能因资源耗尽返回无效句柄,
+        // 此时无法等待ACK确认, 应立即回退到Close()以免Session永久卡在kClosing状态
+        IF NOT shutdown_timer_.IsValid():
+            LOG_ERROR("Session conv={}: failed to allocate shutdown timer, forcing Close", conv_)
+            Close()
 
     // -------------------- 数据发送 --------------------
 
@@ -195,11 +208,23 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
         RETURN result
 
     // 发送协议层握手包 (由Client在连接初始化时调用)
+    // 前置条件: state_ == kIdle (Start前调用, 或Client在DoConnect中调用)
+    // 如果在非kIdle状态调用, 引擎可能处于未初始化/已关闭状态, 行为未定义
     FUNCTION SendHandshakePacket() -> void:
+        IF state_ != SessionState::kIdle:
+            LOG_WARN("Session conv={}: SendHandshakePacket ignored, state={} (only allowed in kIdle)",
+                     conv_, StateToString(state_))
+            RETURN
         engine_.SendHandshake()
 
     // 发送协议层探活包 (由Server在空闲检测时调用)
+    // 前缀条件: state_ == kConnected (仅活跃会话可探活)
+    // 探活包语义: KCP发送WASK命令字→对端自动回复WINS; QUIC发送PING帧→对端回复PONG或携带数据的ACK
     FUNCTION SendProbePacket() -> void:
+        IF state_ != SessionState::kConnected:
+            LOG_DEBUG("Session conv={}: SendProbePacket skipped, state={} (not connected)",
+                     conv_, StateToString(state_))
+            RETURN
         engine_.SendProbe()
 
     // -------------------- 数据接收 --------------------
@@ -259,7 +284,10 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
             idle_threshold_ms: uint32_t = 15000,
             stale_threshold_ms: uint32_t = 30000
     ) -> ConnectionHealth:
-        elapsed = now_ms - last_recv_time_ms_
+        // 防御时钟回退: 当NTP校时/系统挂起恢复等导致now_ms < last_recv_time_ms_时,
+        // 无符号减法会回绕为极大值(~2^64)从而误判为stale,
+        // 以saturating subtract处理: now_ms < last_recv_time_ms_ → elapsed = 0 (视为刚收到数据)
+        elapsed = (now_ms > last_recv_time_ms_) ? (now_ms - last_recv_time_ms_) : 0
         IF elapsed >= stale_threshold_ms:
             RETURN ConnectionHealth::kStale
         IF elapsed >= idle_threshold_ms:
@@ -276,6 +304,18 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
             LOG_WARN("Session conv={}: ApplyConfig ignored, state={} (only allowed in kIdle)",
                      conv_, StateToString(state_))
             RETURN
+        // 检测协议引擎类型变更: 若engine_type不同, 销毁旧引擎并重建,
+        // 避免config_记录为QUIC但engine_仍是KCP实例的静默不一致
+        IF config.engine_type != config_.engine_type:
+            engine_.reset()
+            engine_ = ProtocolEngineFactory::Create(config)
+            // 重建后重新注册输出回调 (新引擎无回调绑定,需重新绑定到Socket)
+            engine_.SetOutputCallback([this](const uint8_t* buf, size_t len):
+                socket_.SendTo(buf, len, remote_addr_)
+            )
+            LOG_INFO("Session conv={}: engine type changed from {} to {}",
+                     conv_, EngineTypeToString(config_.engine_type),
+                     EngineTypeToString(config.engine_type))
         config_ = config
         engine_.ApplyConfig(config_)
 
@@ -391,19 +431,31 @@ FUNCTION ParseHeader(data: span<const uint8_t>, engine_type: EngineType) -> std:
     // 最小头部大小由协议引擎类型决定:
     //   KCP:  MIN_HEADER_SIZE = 24 字节 (conv+cmd+frag+wnd+ts+sn+una+len)
     //   QUIC: MIN_HEADER_SIZE = 1  字节 (短头HeaderForm,不含CID和PacketNumber)
-    IF data.size() < MIN_HEADER_SIZE:
-        RETURN std::nullopt
-
-    header = Header{}
-    header.conv     = ReadBigEndianU32(data, 0)   // 会话标识
-    header.cmd      = data[4]                     // 命令字
-    header.frag_id  = data[5]                     // 分片标识
-    header.recv_wnd = ReadBigEndianU16(data, 6)   // 对端窗口通告
-    header.ts       = ReadBigEndianU32(data, 8)   // 发送方时间戳
-    header.sn       = ReadBigEndianU32(data, 12)  // 序列号
-    header.una      = ReadBigEndianU32(data, 16)  // 累积确认号
-    header.len      = ReadBigEndianU32(data, 20)  // 有效载荷长度
-    RETURN header
+    // 关键: KCP头部固定24字节偏移解析; QUIC头部格式不同(长头/短头变长),
+    //       需要委托ProtocolEngine::ParseHeader进行协议特定解析,
+    //       避免对QUIC数据包按KCP固定偏移读取导致越界访问
+    SWITCH engine_type:
+        CASE EngineType::kEngineKCP:
+            // KCP头部固定24字节, 按固定偏移解析各字段 (大端序)
+            IF data.size() < 24:
+                RETURN std::nullopt
+            header = Header{}
+            header.conv     = ReadBigEndianU32(data, 0)   // 会话标识
+            header.cmd      = data[4]                     // 命令字
+            header.frag_id  = data[5]                     // 分片标识
+            header.recv_wnd = ReadBigEndianU16(data, 6)   // 对端窗口通告
+            header.ts       = ReadBigEndianU32(data, 8)   // 发送方时间戳
+            header.sn       = ReadBigEndianU32(data, 12)  // 序列号
+            header.una      = ReadBigEndianU32(data, 16)  // 累积确认号
+            header.len      = ReadBigEndianU32(data, 20)  // 有效载荷长度
+            RETURN header
+        CASE EngineType::kEngineQUIC:
+            // QUIC头部变长 (短头1B type + 0-20B CID + 1-4B PN; 长头1B type + 4B version +
+            // DCIL+DCID+SCIL+SCID + 1-4B PN), 委托ProtocolEngine静态方法解析,
+            // 避免KCP固定偏移代码对QUIC包越界读取 (如5字节QUIC包访问data[20]→OOB)
+            RETURN ProtocolEngine::ParseQUICHeader(data)
+        DEFAULT:
+            RETURN std::nullopt
 ```
 
 ---

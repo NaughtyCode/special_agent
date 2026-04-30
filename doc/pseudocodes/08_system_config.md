@@ -217,28 +217,28 @@ CLASS ConfigurationManager:
         RETURN std::atomic_load(&config_)
 
     // 便捷访问: 获取库级配置
-    // 实现注意: 调用方必须持GetConfig()返回的shared_ptr以延长生命周期,
-    //          不应在临时shared_ptr上调用此方法 (会导致悬空引用)
-    // 安全用法: auto cfg_handle = config_mgr.GetConfig();
-    //          auto& lib = cfg_handle->library;  // 而非 GetLibraryConfig()
-    FUNCTION GetLibraryConfig() -> const LibraryConfig&:
-        RETURN GetConfig()->library
+    // 关键: 旧实现返回const&引用到临时shared_ptr管理的对象 (GetConfig()返回临时shared_ptr),
+    //       临时shared_ptr析构后引用悬空; 新实现返回shared_ptr副本, 调用方自行解引用
+    // 安全用法: auto cfg = config_mgr.GetConfig(); auto& lib = cfg->library;
+    // 这些便捷方法已被标记为[DEPRECATED], 推荐直接使用GetConfig()
+    FUNCTION GetLibraryConfig() -> ConfigPtr:
+        RETURN GetConfig()   // 返回shared_ptr副本, 调用方持有引用计数确保对象存活
 
     // 便捷访问: 获取Session默认配置 (用于构造新Session)
-    FUNCTION GetSessionDefaults() -> const SessionDefaultsConfig&:
-        RETURN GetConfig()->session_defaults
+    FUNCTION GetSessionDefaults() -> ConfigPtr:
+        RETURN GetConfig()
 
     // 便捷访问: 获取服务端配置
-    FUNCTION GetServerConfig() -> const ServerEndpointConfig&:
-        RETURN GetConfig()->server
+    FUNCTION GetServerConfig() -> ConfigPtr:
+        RETURN GetConfig()
 
     // 便捷访问: 获取客户端配置
-    FUNCTION GetClientConfig() -> const ClientEndpointConfig&:
-        RETURN GetConfig()->client
+    FUNCTION GetClientConfig() -> ConfigPtr:
+        RETURN GetConfig()
 
     // 便捷访问: 获取WorkerPool配置
-    FUNCTION GetWorkerPoolConfig() -> const WorkerPoolConfig&:
-        RETURN GetConfig()->worker_pool
+    FUNCTION GetWorkerPoolConfig() -> ConfigPtr:
+        RETURN GetConfig()
 
     // -------------------- 反序列化 (JSON → 类型化配置) --------------------
 
@@ -449,9 +449,15 @@ CLASS ConfigurationManager:
         // - 文件解析失败 (已在Deserialize阶段返回false)
         // - Server和Client同时启用但绑定地址冲突 (只有两者都启用时才检查)
         // - 必填字段缺失 (如Server enabled但未配置listen_port)
+        // - 端口为0的配置是阻塞错误: 端口0无法建立连接/监听, 不应在启动时允许
+        IF config->server.enabled AND config->server.listen_port == 0:
+            LOG_ERROR("Server enabled but listen_port is 0 (must be 1-65535)")
+            RETURN true
+        IF config->client.enabled AND config->client.remote_port == 0:
+            LOG_ERROR("Client enabled but remote_port is 0 (must specify server port)")
+            RETURN true
         IF config->server.enabled AND config->client.enabled:
             // 检查Server绑定地址与Client本地绑定地址是否冲突
-            // (非Server监听端口与Client远程端口 — 两者语义不同,不冲突)
             IF config->server.listen_port == config->client.local_bind_port AND
                config->server.listen_ip == config->client.local_bind_ip AND
                config->client.local_bind_port != 0:   // 0=随机端口,无冲突
@@ -482,18 +488,20 @@ CLASS ConfigurationManager:
     // 应用命令行参数覆盖 (优先级最高,在LoadFromFile之后调用)
     // 格式: --section.field=value
     // 示例: --server.listen_port=9000 --session_defaults.mtu_bytes=1200
+    // 保存命令行覆盖用于重载时重新应用 (最高优先级)
     FUNCTION ApplyCmdLineOverrides(cmdline: ParsedCommandLine) -> void:
+        saved_cmdline_overrides_ = cmdline  // 保存以便Reload时重新应用
+        // 复制配置一次 (在循环外), 批量应用所有覆盖, 最后原子替换
+        new_config = std::make_shared<SystemConfig>(*GetConfig())
         FOR EACH (key, value) IN cmdline:
-            // 解析路径: "server.listen_port" → section="server", field="listen_port"
             path = key   // 已去掉 "--" 前缀,由ParseCommandLine处理
             DOT_POS = path.Find(".")
             IF DOT_POS == std::string::npos: CONTINUE
             section = path.Substring(0, DOT_POS)
             field   = path.Substring(DOT_POS + 1)
-            new_config = std::make_shared<SystemConfig>(*GetConfig())   // 复制当前配置
             ApplyOverrideBySectionField(new_config.get(), section, field, value)
-            std::atomic_store(&config_, new_config)
             LOG_INFO("CmdLine override: --{}={}", path, value)
+        std::atomic_store(&config_, new_config)
 
     // -------------------- 运行时重载 --------------------
 
@@ -503,6 +511,10 @@ CLASS ConfigurationManager:
     FUNCTION Reload(file_path: const std::string&) -> bool:
         success = LoadFromFile(file_path)
         IF success:
+            // 重新应用命令行覆盖 (最高优先级: JSON < env < cmdline)
+            // LoadFromFile中已应用env覆盖, 此处补上cmdline覆盖以防重载后丢失
+            IF saved_cmdline_overrides_.has_value():
+                ApplyCmdLineOverrides(saved_cmdline_overrides_.value())
             // 通知各组件配置已变更 (观察者模式)
             NotifyConfigChanged()
         RETURN success

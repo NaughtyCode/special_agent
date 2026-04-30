@@ -50,6 +50,8 @@ FUNCTION LibraryInitialize(config_file_path: string = "netlib_config.json"):
     config_mgr = ConfigurationManager()
     IF NOT config_mgr.LoadFromFile(config_file_path):
         LOG_FATAL("Failed to load configuration from {}", config_file_path)
+        // LOG_FATAL: 致命级日志宏 (定义见 log_manager.h), 低于此级别的日志在Release下编译期裁剪
+        // 该调用触发用户注册的fatal handler (如有) 并刷新日志缓冲区后进程退出
         RETURN false
 
     // 步骤2: 应用命令行覆盖 (最高优先级)
@@ -85,9 +87,14 @@ FUNCTION LibraryInitialize(config_file_path: string = "netlib_config.json"):
     // 步骤7: 注册运行时配置重载 (SIGHUP或管理接口触发)
     //        仅修改可热更新的参数 (日志级别/超时阈值等)
     //        io_backend/端口等需重启生效
-    SignalHandler::OnSIGHUP([&config_mgr]():   // SignalHandler: 平台信号处理封装 (SIGHUP用于配置重载)
-                                                  // 定义在 platform/signal_handler.h 中
-        config_mgr.Reload(config_file_path)
+    // 步骤7: 注册运行时配置重载 (SIGHUP或管理接口触发)
+    //        仅修改可热更新的参数 (日志级别/超时阈值等)
+    //        io_backend/端口等需重启生效
+    // 关键: 使用shared_ptr捕获config_mgr, 避免SIGHUP回调中config_mgr被析构导致悬空引用
+    //       (config_mgr是栈变量, 函数返回后即失效; shared_ptr确保其生命周期覆盖信号处理器的存活期)
+    config_mgr_ptr = std::make_shared<ConfigurationManager>(std::move(config_mgr))
+    SignalHandler::OnSIGHUP([config_mgr_ptr]():   // SignalHandler: 平台信号处理封装 (SIGHUP用于配置重载)
+        config_mgr_ptr->Reload(config_file_path)   // 定义在 platform/signal_handler.h 中
     )
 
     // 配置覆盖示例 — 各层参数均可被JSON/环境变量/命令行覆盖:
@@ -105,7 +112,8 @@ FUNCTION LibraryInitialize(config_file_path: string = "netlib_config.json"):
 // --------------------------------------------------
 FUNCTION ServerStart(config: ServerConfig):
     // 步骤1: 创建事件循环 (IO后端可替换)
-    event_loop = EventLoop::Create(config.io_backend)
+    // 统一使用构造函数: EventLoop(ParseIOBackend(...)), 与LibraryInitialize中一致
+    event_loop = EventLoop(ParseIOBackend(config.io_backend))
 
     // 步骤2: 创建Server端点,绑定地址
     server = Server(event_loop, config.listen_address)
@@ -135,7 +143,8 @@ FUNCTION ServerStart(config: ServerConfig):
 // 3.3 客户端连接流程 (泛化)
 // --------------------------------------------------
 FUNCTION ClientConnect(config: ClientConfig):
-    event_loop = EventLoop::Create(config.io_backend)
+    // 统一使用构造函数: EventLoop(ParseIOBackend(...)), 与LibraryInitialize中一致
+    event_loop = EventLoop(ParseIOBackend(config.io_backend))
 
     client = Client(event_loop)
     client.SetSessionConfig(config.session_config)

@@ -53,7 +53,12 @@ CLASS EventLoop:
         wakeup_channel_ = impl_.CreateWakeupChannel()
 
     DESTRUCTOR ~EventLoop():
+        // 必须确保Run()已退出后才能析构impl_ (否则Run()可能正在调用impl_.WaitForEvents,
+        // 析构impl_会导致use-after-free)。Stop()仅设置flag+唤醒, 不等待Run()退出;
+        // 调用方应确保在析构EventLoop前已从Run()返回(如通过WorkerPool::Shutdown的join)
         Stop()
+        // 注意: 不在此处join内部线程(EventLoop不拥有自己的线程, 由调用方管理线程生命周期);
+        //       多线程模式下由WorkerPool::Shutdown负责join各Worker线程
         impl_.Reset()
 
     // -------------------- 生命周期管理 --------------------
@@ -158,7 +163,7 @@ CLASS EventLoop:
         impl_.WakeUp(wakeup_channel_)
 
     PRIVATE MEMBER impl_: std::unique_ptr<IOBackendImpl>  // 平台实现 (Pimpl惯用法)
-    PRIVATE MEMBER state_: RunState = kStopped
+    PRIVATE MEMBER state_: std::atomic<RunState> = kStopped  // 原子变量: Stop()从任意线程写入, Run()在事件循环线程读取, 无数据竞争
     PRIVATE MEMBER pending_tasks_: TaskQueue               // 异步任务队列
     PRIVATE MEMBER timer_queue_: TimerQueue                // 定时器队列
     PRIVATE MEMBER wakeup_channel_: WakeupHandle           // 唤醒通道句柄
@@ -260,14 +265,32 @@ CLASS DatagramSocket:
         Bind(fd_, bind_addr)
 
     DESTRUCTOR ~DatagramSocket():
+        // 通知EventLoop取消注册以避免EventLoop在已销毁的IEventHandler上分发事件
+        // (fd关闭后OS可能复用该fd值, EventLoop保留旧注册会导致事件路由到错误处理器)
         IF fd_ IS VALID:
+            event_loop_.Unregister(EventDesc{uintptr_t(fd_), Platform::Current()})
             ::close(fd_)
 
-    // 禁止拷贝,允许移动
+    // 禁止拷贝, 自定义移动 (fd_需转移所有权, 避免double-close)
     DatagramSocket(const DatagramSocket&) = delete
     DatagramSocket& operator=(const DatagramSocket&) = delete
-    DatagramSocket(DatagramSocket&& other) = default
-    DatagramSocket& operator=(DatagramSocket&& other) = default
+    DatagramSocket(DatagramSocket&& other) noexcept:
+        fd_(other.fd_),
+        event_loop_(other.event_loop_),
+        config_(std::move(other.config_))
+    {
+        other.fd_ = -1  // 将源对象fd标记为无效, 防止析构时double-close
+    }
+    DatagramSocket& operator=(DatagramSocket&& other) noexcept:
+        IF this != &other:
+            IF fd_ >= 0:
+                event_loop_->Unregister(EventDesc{uintptr_t(fd_), Platform::Current()})
+                ::close(fd_)
+            fd_ = other.fd_
+            event_loop_ = other.event_loop_
+            config_ = std::move(other.config_)
+            other.fd_ = -1
+        RETURN *this
 
     // -------------------- 数据收发 --------------------
 
@@ -325,23 +348,22 @@ CLASS DatagramSocket:
 
     // 启用可写通知 (发送缓冲区从满→可用 转变时通知)
     // 仅在发送遇到kWouldBlock后需要等待恢复时使用
+    // Modify仅修改事件掩码, handler已在Register中关联, 无需重复传入
     FUNCTION EnableWriteNotifications(handler: IEventHandler*) -> void:
         event_loop_.Modify(
             EventLoop::EventDesc{fd_, Platform::Current()},
             EventLoop::IOMask::kReadable | EventLoop::IOMask::kWritable
-            | EventLoop::IOMask::kEdgeTriggered,
-            handler
+            | EventLoop::IOMask::kEdgeTriggered
         )
 
     // 关闭可写通知 (恢复为仅监听可读)
     FUNCTION DisableWriteNotifications(handler: IEventHandler*) -> void:
         event_loop_.Modify(
             EventLoop::EventDesc{fd_, Platform::Current()},
-            EventLoop::IOMask::kReadable | EventLoop::IOMask::kEdgeTriggered,
-            handler
+            EventLoop::IOMask::kReadable | EventLoop::IOMask::kEdgeTriggered
         )
 
-    PRIVATE MEMBER fd_: int
+    PRIVATE MEMBER fd_: SocketHandle  // 跨平台Socket句柄: POSIX=int(32/64位), Windows=SOCKET(UINT_PTR 64位), 使用uintptr_t确保不截断
     PRIVATE MEMBER event_loop_: EventLoop*
     PRIVATE MEMBER config_: SocketConfig
 ```
@@ -383,10 +405,15 @@ CLASS WorkerPool:
                        : std::thread::hardware_concurrency()
         strategy_ = strategy
 
+        // 预分配vector容量, 防止后续push_back时vector重分配导致已启动线程的
+        // lambda引用捕获 [&workers = workers_] 悬空 (重分配后旧内存失效)
+        workers_.reserve(worker_count)
         FOR i IN RANGE(0, worker_count):
             worker = Worker{}
             workers_.Push(std::move(worker))
             // 启动线程: EventLoop::Run() 在各自线程阻塞
+            // 安全前提: workers_已reserve, 后续push_back不会再触发重分配,
+            //           已启动线程中对workers_的引用保持有效
             workers_[i].thread = std::thread([&workers = workers_, i]():
                 workers[i].event_loop.Run()
             )
@@ -536,26 +563,39 @@ CLASS TimerQueue:
             IF heap_.empty():
                 RETURN std::nullopt             // 无定时器 → EventLoop可无限等待
             now = Clock::NowMs()
-            remaining = heap_.top().expire_time - now
-            RETURN MAX(0, remaining)
+            // 防御时钟回退+定时器已过期: 若堆顶expire_time <= now,
+            // 定时器已到期应立即触发, 返回0而非做expire_time-now的uint64减法
+            // (两个uint64相减: 当expire_time < now时回绕为~UINT64_MAX, 
+            //  经MAX(0, ~MAX)仍为极大值, 导致EventLoop无限等待而跳过已到期定时器)
+            IF heap_.top().expire_time <= now:
+                RETURN 0
+            remaining = static_cast<uint32_t>(heap_.top().expire_time - now)
+            RETURN remaining
 
     // 执行所有已到期的定时器回调
-    // 注意: 回调在锁内执行; 回调中不得:
-    //   a. 调用TimerQueue的Add/Cancel — 会导致死锁 (mutex_非递归)
-    //   b. 执行长时间阻塞操作 — 会阻塞所有定时器的触发和GetNextTimeout调用
-    // 如回调需要上述操作,应在回调中将任务投递到TaskQueue异步执行
+    // 关键: 回调在锁外执行以避免死锁 — 若回调中调用Add/Cancel (如GracefulShutdown
+    //       定时器触发后调用Close→CancelShutdownTimer→Cancel), 在非递归mutex_下会死锁
+    // 实现: 锁定→收集到期回调→解锁→执行回调→锁定→处理重复定时器重新入堆
     FUNCTION FireExpired(now: uint64_t) -> void:
+        // 步骤1: 收集所有到期且未取消的定时器 (锁内操作)
+        to_fire = std::vector<TimerEntry>{}
         LOCK(mutex_):
             WHILE !heap_.empty() AND heap_.top().expire_time <= now:
                 entry = heap_.top()
                 heap_.pop()
                 IF canceled_.contains(entry.id):
-                    canceled_.erase(entry.id)
+                    canceled_.erase(entry.id)  // 惰性清理已取消条目
                     CONTINUE
-                entry.callback()            // 执行回调
-                IF entry.interval_ms > 0:   // 重复定时器: 更新到期时间后重新入堆
-                    entry.expire_time = now + entry.interval_ms
-                    heap_.push(std::move(entry))
+                to_fire.push_back(std::move(entry))
+        // 步骤2: 在锁外执行回调 (回调中可安全调用Add/Cancel, 不会死锁)
+        FOR EACH entry IN to_fire:
+            entry.callback()
+            IF entry.interval_ms > 0:
+                // 重复定时器: 更新到期时间后重新入堆 (在锁内操作)
+                LOCK(mutex_):
+                    IF NOT canceled_.contains(entry.id):
+                        entry.expire_time = now + entry.interval_ms
+                        heap_.push(std::move(entry))
 ```
 
 ---

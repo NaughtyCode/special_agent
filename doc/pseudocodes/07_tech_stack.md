@@ -41,8 +41,8 @@
               return IOBackend::kEpoll
           #elif defined(_WIN32)
               return IOBackend::kIocp
-          #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__)
-              return IOBackend::kKqueue
+          #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+              return IOBackend::kKqueue  // NetBSD/DragonFly BSD同样支持kqueue, 避免回退到性能较差的poll
           #else
               return IOBackend::kPoll      // 通用POSIX回退
           #endif

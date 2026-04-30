@@ -115,6 +115,7 @@ CLASS Server:
     FUNCTION Stop() -> void:
         IF state_ == ServerState::kStopped: RETURN
         state_ = ServerState::kStopped
+        stopping_ = true  // 标记正在停止, 阻止OnStateChange/OnError回调中PostTask(RemoveSession)产生僵尸任务
 
         LOG_INFO("Server stopped: {} sessions active at shutdown",
                  sessions_.size())
@@ -123,7 +124,7 @@ CLASS Server:
         event_loop_.CancelTimer(health_timer_)
         event_loop_.CancelTimer(drive_timer_)
 
-        // 根据驱逐策略处理所有现存会话
+        // 根据驱逐策略处理所有现存会话 (stopping_=true, 回调不再PostTask RemoveSession)
         FOR EACH (conv, session) IN sessions_:
             EvictSession(session, EvictReason::kLocalClosed)
         sessions_.clear()
@@ -188,12 +189,17 @@ CLASS Server:
                     config_.session_config
                 )
                 session->Start()
-                session->FeedInput(result.data, result.len)
 
-                // 注册Session内部事件,向上层传播
+                // 关键顺序: WireSessionEvents必须在FeedInput之前调用,
+                // 否则FeedInput中的TryRecv()触发message_callback时回调尚未注册,
+                // 导致首包中的用户消息永久丢失 (引擎已消费但无法投递)
                 WireSessionEvents(session)
 
                 sessions_[routing_key.value()] = session
+
+                // FeedInput放在WireSessionEvents之后: 确保OnError回调已注册,
+                // 若首包包含关闭通知或协议错误, Server可正确响应并清理会话
+                session->FeedInput(result.data, result.len)
 
                 LOG_INFO("Server: new session accepted, conv={}, from={}",
                          routing_key.value(), result.sender.ToString())
@@ -292,6 +298,9 @@ CLASS Server:
 
         // 错误事件 → 驱逐 (远程关闭或协议错误)
         session->OnError([this, conv](SessionError e):
+            // 检查stopping_标志: Stop()中关闭所有会话时stopping_=true,
+            // 此时跳过PostTask以避免产生N个僵尸RemoveSession任务
+            IF stopping_: RETURN
             EvictReason reason = (e == SessionError::kRemoteClose)
                 ? EvictReason::kRemoteClosed
                 : EvictReason::kError
@@ -303,6 +312,8 @@ CLASS Server:
 
         // 状态变更事件 → 会话自行进入kClosed时触发清理
         session->OnStateChange([this, conv](SessionState old_state, SessionState new_state):
+            // 检查stopping_标志: 避免Stop()产生的PostTask僵尸任务
+            IF stopping_: RETURN
             IF new_state == SessionState::kClosed:
                 event_loop_->PostTask([this, conv]():
                     RemoveSession(conv, EvictReason::kLocalClosed)
@@ -315,20 +326,18 @@ CLASS Server:
     PRIVATE FUNCTION ExtractRoutingKey(
             data: const uint8_t*, len: size_t
     ) -> std::optional<uint32_t>:
-        // KCP:  conv 位于偏移0, 4字节大端无符号整数; 最小头部24字节
-        // QUIC: Connection ID提取逻辑根据引擎类型不同:
-        //   - 长头 (Initial/Handshake): HeaderForm(1) + Reserved(2) + Version(4) +
-        //     DCIL(1) + DCID(variable) + SCIL(1) + SCID(variable),取SCID哈希
-        //   - 短头 (1-RTT): HeaderForm(1) + CID(variable),取CID哈希
-        // 为确保协议无关,当engine_type为kEngineQUIC时应调用
-        // ProtocolEngine::ExtractRoutingKey(data, len) 以委托协议特定解析
-        IF len < MIN_HEADER_SIZE: RETURN std::nullopt
+        // 根据引擎类型选择路由键提取策略:
+        //   KCP:  conv位于偏移0, 4字节大端, 最小头部24字节
+        //   QUIC: Connection ID提取协议相关(长头/短头), 最小头部1字节
+        // 关键: 先判断engine_type再检查长度, 避免用KCP的24字节最小长度
+        //       错误拒绝QUIC短头包 (QUIC短头仅需1字节)
         IF config_.session_config.engine_type == EngineType::kEngineQUIC:
             // QUIC的Connection ID提取逻辑复杂(长头/短头格式不同),委托ProtocolEngine静态方法解析
             // 注意: ProtocolEngine::ExtractRoutingKey是静态方法,不依赖引擎实例;
             //       定义在 protocol_engine.h 中,各引擎实现提供对应重载
             RETURN ProtocolEngine::ExtractRoutingKey(data, len)
-        // KCP (默认): conv位于偏移0,4字节大端无符号整数
+        // KCP (默认): 检查最小头部24字节后从偏移0读取4字节大端conv值
+        IF len < 24: RETURN std::nullopt
         RETURN ReadBigEndianU32(data, 0)
 
     // -------------------- 成员变量 --------------------
@@ -341,6 +350,7 @@ CLASS Server:
     PRIVATE MEMBER session_evicted_handler_: SessionEvictedHandler
     PRIVATE MEMBER health_timer_: TimerHandle = 0                   // 健康检测定时器句柄
     PRIVATE MEMBER drive_timer_: TimerHandle = 0                    // 协议驱动定时器句柄
+    PRIVATE MEMBER stopping_: bool = false                          // Stop()过程中标记,阻止wire回调PostTask僵尸任务
     PRIVATE MEMBER recv_buf_: std::vector<uint8_t>                  // 接收缓冲区 (resize后size=可用长度)
 ```
 
