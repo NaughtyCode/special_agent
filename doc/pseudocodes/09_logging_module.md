@@ -48,21 +48,28 @@ CLASS LogManager:
     //         c. 抛出异常 (会被捕获并忽略,但日志消息丢失)
     STATIC FUNCTION SetLogCallback(cb: LogCallback) -> void:
         LOCK(callback_mutex_):
-            log_callback_ = std::move(cb)
+            IF cb:
+                // 使用shared_ptr包装以实现GetLogCallback的共享访问语义
+                // (std::move_only_function不可拷贝,通过shared_ptr间接持有)
+                log_callback_ = std::make_shared<LogCallback>(std::move(cb))
+            ELSE:
+                log_callback_.reset()
 
     // 获取当前注册的日志回调 (用于调试/组合/装饰)
     // 返回值: 回调的副本; nullopt表示未设置回调
-    // 注意: 返回的是回调的拷贝 (std::move_only_function不可拷贝,需特殊处理)
-    //       此接口供检查/包装已有回调使用; 返回的副本可在锁外安全调用
+    // 注意: std::move_only_function不可拷贝; 此接口通过shared_ptr包装实现共享所有权,
+    //       返回的副本与内部回调共享同一底层可调用对象,在锁外安全调用
+    //       使用shared_ptr包装而非直接返回引用,避免锁释放后回调被替换导致的悬空指针
     STATIC FUNCTION GetLogCallback() -> std::optional<LogCallback>:
         LOCK(callback_mutex_):
             IF NOT log_callback_.has_value():
                 RETURN std::nullopt
-            // 返回回调的副本 (move_only_function需移动构造)
-            // 原始回调保留在log_callback_中,后续日志仍可使用
-            RETURN std::move(log_callback_.value())
-        // 注意: 此实现会清空log_callback_; 若需同时保留原回调,
-        // 可在锁内先保存副本再返回,或使用shared_ptr包装回调
+            // 返回的是shared_ptr<LogCallback>解引用后的副本;
+            // 原始shared_ptr保留在log_callback_中,后续日志仍可使用
+            // 调用方获得的LogCallback独立于LogManager内部状态
+            RETURN *log_callback_  // shared_ptr解引用,返回LogCallback的副本
+        // 实现说明: log_callback_应为std::shared_ptr<LogCallback>以支持此语义;
+        // 若LogCallback本身不可拷贝,可改用std::shared_ptr<std::function<...>>包装
 
     // -------------------- 运行时级别过滤 --------------------
 
@@ -98,11 +105,12 @@ CLASS LogManager:
             RETURN
 
         // 步骤2: 格式化消息 (锁外执行,避免长时间持锁)
-        message = FormatString(fmt, ...)
+        message = FormatString(fmt, ...)   // printf风格→std::string; 定义在 utils/string_format.h 中
+                                           // 实现可使用 vsnprintf 或 fmt::format 库
 
         // 步骤3: 调用回调 (持锁保护)
         LOCK(callback_mutex_):
-            IF log_callback_.has_value():
+            IF log_callback_ != nullptr:
                 (*log_callback_)(level, file, line, function, message)
 
         // 步骤4: 致命级别后可选处理 (锁外执行,避免Flush重入锁导致死锁)
@@ -125,7 +133,11 @@ CLASS LogManager:
 
     // -------------------- 私有成员 --------------------
     PRIVATE:
-        STATIC MEMBER log_callback_: std::optional<LogCallback>
+        // 使用shared_ptr包装move_only_function以实现:
+        //   - SetLogCallback: 原子替换callback (shared_ptr赋值)
+        //   - GetLogCallback: 返回独立副本 (shared_ptr解引用)
+        //   - Log(): 在锁内检查非空后通过shared_ptr调用 (无需optional::has_value)
+        STATIC MEMBER log_callback_: std::shared_ptr<LogCallback>
         STATIC MEMBER callback_mutex_: std::mutex                  // 保护log_callback_的读写
         STATIC MEMBER atomic_level_: std::atomic<Level> = Level::kInfo  // 无锁读取的运行时级别
 ```

@@ -54,7 +54,8 @@ FUNCTION LibraryInitialize(config_file_path: string = "netlib_config.json"):
 
     // 步骤2: 应用命令行覆盖 (最高优先级)
     //        如: ./server --server.listen_port=9000 --session_defaults.mtu_bytes=1200
-    config_mgr.ApplyCmdLineOverrides(ParseCommandLine())
+    config_mgr.ApplyCmdLineOverrides(ParseCommandLine())   // ParseCommandLine: 解析argc/argv→键值对映射
+                                                              // 定义在 utils/command_line.h 中
 
     // 步骤3: 获取最终配置快照 (线程安全,不可变)
     config = config_mgr.GetConfig()
@@ -62,26 +63,30 @@ FUNCTION LibraryInitialize(config_file_path: string = "netlib_config.json"):
     // 步骤4: 初始化日志系统 (根据配置文件中的log_level和log_output)
     //        log_output可选: "stdout"/"stderr"/"callback"/文件路径
     //        "callback"模式由应用层通过LogManager::SetLogCallback注册
-    LogManager::SetLevel(ParseLogLevel(config->library.log_level))
+    LogManager::SetLevel(ParseLogLevel(config->library.log_level))   // "info"→kInfo 等字符串→枚举转换
+                                                                      // 定义在 log_manager.cpp 中
     IF config->library.log_output != "callback":
         LogManager::SetLogCallback(CreateDefaultLogSink(config->library.log_output))
 
     // 步骤5: 根据配置创建IO后端 (自动检测或显式指定)
     //        config->library.io_backend: "auto"/"epoll"/"iocp"/"kqueue"/"poll"
-    event_loop = EventLoop(ParseIOBackend(config->library.io_backend))
+    event_loop = EventLoop(ParseIOBackend(config->library.io_backend))   // "epoll"→kEpoll 等字符串→枚举转换
+                                                                          // 定义在 platform/io_backend_utils.cpp 中
 
     // 步骤6: 创建WorkerPool (如配置多线程模式)
     //        config->worker_pool.num_workers: 0=硬件并发数
     IF config->worker_pool.num_workers > 1 OR config->worker_pool.num_workers == 0:
         worker_pool = WorkerPool(
             config->worker_pool.num_workers,
-            ParseDispatchStrategy(config->worker_pool.dispatch_strategy)
+            ParseDispatchStrategy(config->worker_pool.dispatch_strategy)  // "modulo"→kModuloHash 等
+                                                                            // 定义见: WorkerPool配置→DispatchStrategy枚举映射
         )
 
     // 步骤7: 注册运行时配置重载 (SIGHUP或管理接口触发)
     //        仅修改可热更新的参数 (日志级别/超时阈值等)
     //        io_backend/端口等需重启生效
-    SignalHandler::OnSIGHUP([&config_mgr]():
+    SignalHandler::OnSIGHUP([&config_mgr]():   // SignalHandler: 平台信号处理封装 (SIGHUP用于配置重载)
+                                                  // 定义在 platform/signal_handler.h 中
         config_mgr.Reload(config_file_path)
     )
 
@@ -135,10 +140,10 @@ FUNCTION ClientConnect(config: ClientConfig):
     client = Client(event_loop)
     client.SetSessionConfig(config.session_config)
     client.SetReconnectStrategy(ExponentialBackoff{
-        .initial_delay_ms = 1000,
-        .max_delay_ms     = 30000,
-        .max_attempts     = 5,
-        .backoff_factor   = 2.0
+        initial_delay_ms = 1000,
+        max_delay_ms     = 30000,
+        max_attempts     = 5,
+        backoff_factor   = 2.0
     })
 
     // Connect是异步的: 成功/失败通过回调通知
@@ -215,7 +220,8 @@ FUNCTION TimerDriveFlow(event_loop, sessions):
     //   e. 更新拥塞/流控状态 (如启用)
 
     event_loop.AddPeriodicTimer(
-        config.update_tick_ms,
+        session_config.update_interval_ms,   // Session::Config::update_interval_ms (默认10ms)
+                                             // 与协议引擎内部时钟周期对齐,确保Update调用频率一致
         FUNCTION():
             now = Clock::NowMs()
             FOR EACH session IN active_sessions:
@@ -247,8 +253,10 @@ FUNCTION ConnectionHealthCheck(server, config):
                     server.HandleIdleSession(session, config.idle_policy)
 
             // 批量清理过期会话 (避免遍历中修改Map)
+            // 通过RemoveSession统一处理驱逐,而非直接调用EvictSession
+            // (Server::EvictSession接受shared_ptr<Session>,此处只有conv,调用RemoveSession委托查找+驱逐)
             FOR EACH conv IN stale_list:
-                server.EvictSession(conv, EvictReason::kTimedOut)
+                server.RemoveSession(conv, EvictReason::kTimedOut)
 
 // --------------------------------------------------
 // 3.8 协议配置模式

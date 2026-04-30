@@ -62,6 +62,8 @@ CLASS EventLoop:
     FUNCTION Run() -> void:
         state_ = kRunning
         LOG_INFO("EventLoop: started (backend={})", BackendToString(impl_.GetBackend()))
+        // BackendToString: 将IOBackend枚举转为字符串 ("epoll"/"iocp"/"kqueue"/"poll")
+        // 定义在 platform/io_backend_utils.cpp 中
         WHILE state_ == kRunning:
             // 步骤1: 获取最近定时器剩余时间作为IO等待上限
             //   std::nullopt 表示无定时器 → 可无限等待,直到IO事件到达
@@ -188,16 +190,32 @@ CLASS DatagramSocket:
             RETURN NOT (*this == other)
 
         STATIC FUNCTION Any() -> Address:
-            RETURN Address{.ip = "0.0.0.0", .port = 0, .family = kIPv4}
+            addr = Address{}
+            addr.ip = "0.0.0.0"
+            addr.port = 0
+            addr.family = kIPv4
+            RETURN addr
 
         STATIC FUNCTION From(ip: string, port: uint16_t) -> Address:
-            RETURN Address{.ip = ip, .port = port, .family = DetectFamily(ip)}
+            addr = Address{}
+            addr.ip = ip
+            addr.port = port
+            addr.family = DetectFamily(ip)
+            RETURN addr
 
         // 返回人类可读的地址表示: "ip:port" 或 "unix:/path" (Unix Domain)
         FUNCTION ToString() -> std::string:
             IF family == AddressFamily::kUnixDomain:
                 RETURN "unix:" + ip
             RETURN ip + ":" + std::to_string(port)
+
+        // 从平台原生sockaddr结构转换为Address (平台相关实现)
+        STATIC FUNCTION FromSystem(sa: const sockaddr*, addr_len: socklen_t) -> Address:
+            // 实现位于 platform/<os>/address_utils.cpp:
+            //   - IPv4: 提取sin_addr→ip, sin_port→port (ntohs)
+            //   - IPv6: 提取sin6_addr→ip, sin6_port→port (ntohs)
+            //   - Unix: 提取sun_path→ip, family=kUnixDomain
+            // 根据sa_family分派: AF_INET / AF_INET6 / AF_UNIX
 
     // 接收结果: 数据指针指向调用方传入的缓冲区
     // 调用方必须在RecvResult生命周期内保持buffer有效
@@ -278,19 +296,17 @@ CLASS DatagramSocket:
     ) -> std::expected<std::optional<RecvResult>, SocketError>:
         sender_addr: sockaddr_storage
         addr_len: socklen_t = sizeof(sender_addr)
-        sender_addr: sockaddr_storage
-        addr_len: socklen_t = sizeof(sender_addr)
         // 非阻塞接收: 平台适配标志由PLATFORM_RECV_FLAGS统一处理
         // (POSIX: MSG_DONTWAIT, Windows: 已设非阻塞模式)
         n = ::recvfrom(fd_, buffer, buffer_capacity, PLATFORM_RECV_FLAGS,
                        CAST(sockaddr*, &sender_addr), &addr_len)
         IF n > 0:
-            RETURN RecvResult{
-                .data          = buffer,
-                .len           = size_t(n),
-                .sender        = Address::FromSystem(&sender_addr, addr_len),
-                .timestamp_ms  = Clock::NowMs()
-            }
+            result = RecvResult{}
+            result.data          = buffer
+            result.len           = size_t(n)
+            result.sender        = Address::FromSystem(&sender_addr, addr_len)  // sockaddr→Address转换,见下方辅助函数定义
+            result.timestamp_ms  = Clock::NowMs()
+            RETURN result
         IF IS_WOULD_BLOCK_ERROR():
             RETURN std::nullopt                          // 无就绪数据
         // 返回值区分: ICMP错误等不影响继续使用Socket,记录日志
@@ -301,7 +317,8 @@ CLASS DatagramSocket:
     // 注册可读通知回调 (Socket有数据到达 → EventLoop触发handler.OnReadable())
     FUNCTION SetReadHandler(handler: IEventHandler*) -> void:
         event_loop_.Register(
-            EventLoop::EventDesc{fd_, Platform::Current()},
+            EventLoop::EventDesc{fd_, Platform::Current()},  // Platform::Current(): 编译期返回当前平台枚举
+                                                               // 实现: #if defined(__linux__)→kLinux, etc.
             EventLoop::IOMask::kReadable | EventLoop::IOMask::kEdgeTriggered,
             handler
         )
@@ -497,12 +514,12 @@ CLASS TimerQueue:
     ) -> TimerHandle:
         LOCK(mutex_):
             id = next_id_++
-            heap_.push(TimerEntry{
-                .id          = id,
-                .expire_time = Clock::NowMs() + delay_or_interval_ms,
-                .interval_ms = repeat ? delay_or_interval_ms : 0,
-                .callback    = std::move(callback)
-            })
+            entry = TimerEntry{}
+            entry.id = id
+            entry.expire_time = Clock::NowMs() + delay_or_interval_ms
+            entry.interval_ms = repeat ? delay_or_interval_ms : 0
+            entry.callback = std::move(callback)
+            heap_.push(std::move(entry))
             RETURN id
 
     FUNCTION Cancel(id: TimerHandle) -> void:

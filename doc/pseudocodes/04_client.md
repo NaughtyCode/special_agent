@@ -157,7 +157,8 @@ CLASS Client:
             // 无重连策略: 直接通知失败
             LOG_ERROR("Client: connect failed to {}:{}, timeout",
                       config_.remote_address.ip, config_.remote_address.port)
-            event_loop_.CancelTimer(connect_timer_)
+            // connect_timer_为一次性定时器,已触发后无需Cancel
+            // (定时器触发时已自动从TimerQueue移除;CancelTimer仅在手动断开等非触发路径需要)
             NotifyConnectFailure(ConnectError::kTimeout)
             RETURN
 
@@ -167,7 +168,7 @@ CLASS Client:
             LOG_ERROR("Client: max retries exceeded ({}) to {}:{}",
                       strategy.max_attempts,
                       config_.remote_address.ip, config_.remote_address.port)
-            event_loop_.CancelTimer(connect_timer_)
+            // connect_timer_为一次性定时器,已触发;无需Cancel
             NotifyConnectFailure(ConnectError::kMaxRetriesExceeded)
             RETURN
 
@@ -179,7 +180,7 @@ CLASS Client:
             strategy.initial_delay_ms * POW(strategy.backoff_factor, retry_count_ - 1),
             strategy.max_delay_ms
         )
-        jitter = RandomRange(0, strategy.jitter_ms)
+        jitter = RandomRange(0, strategy.jitter_ms)   // 均匀随机数 [0, jitter_ms], 定义在 utils/random.h
         delay += jitter
 
         state_ = ClientState::kReconnecting

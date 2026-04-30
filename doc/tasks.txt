@@ -18,5 +18,6 @@ claude --dangerously-skip-permissions
 10. 按 ./doc/issues/issue10.txt 的要求执行
 11. 按 ./doc/issues/issue11.txt 的要求执行
 12. 按 ./doc/issues/issue12.txt 的要求执行
+13. 按 ./doc/issues/issue13.txt 的要求执行
 
 

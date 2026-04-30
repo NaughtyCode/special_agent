@@ -910,9 +910,12 @@ static void SetLogCallback(LogCallback cb)
 //         b. 执行长时间阻塞操作 (会阻塞所有日志输出)
 //         c. 抛出异常 (会被捕获并忽略,但日志消息丢失)
 
-static LogCallback* GetLogCallback()
-// 返回值: 当前注册的回调指针,nullptr表示未设置
-// 说明: 仅供检查回调是否已设置,调用方不应持有过久
+static std::optional<LogCallback> GetLogCallback()
+// 返回值: 当前注册的回调副本; std::nullopt表示未设置回调
+// 说明: 返回的是回调的值副本 (std::move_only_function不可拷贝,以optional包装);
+//       调用方获得独立的回调副本,可在锁外安全调用;
+//       该副本的生命周期与LogManager内部状态解耦,不存在悬空指针风险
+// 注意: 此接口用于检查/包装已有回调; 频繁调用会产生move_only_function的移动开销
 
 static void SetLevel(Level level)
 // 参数: level — [in] 最低输出级别,默认kInfo

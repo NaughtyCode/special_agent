@@ -271,7 +271,11 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
 
     // 运行时更新配置 (仅允许在kIdle状态调用以确保安全)
     FUNCTION ApplyConfig(config: Config) -> void:
-        IF state_ != kIdle: RETURN
+        IF state_ != kIdle:
+            // 非kIdle状态下配置不生效,调用方可能不知情 — 输出警告辅助排查
+            LOG_WARN("Session conv={}: ApplyConfig ignored, state={} (only allowed in kIdle)",
+                     conv_, StateToString(state_))
+            RETURN
         config_ = config
         engine_.ApplyConfig(config_)
 
@@ -390,16 +394,16 @@ FUNCTION ParseHeader(data: span<const uint8_t>, engine_type: EngineType) -> std:
     IF data.size() < MIN_HEADER_SIZE:
         RETURN std::nullopt
 
-    RETURN Header{
-        .conv     = ReadBigEndianU32(data, 0),   // 会话标识
-        .cmd      = data[4],                     // 命令字
-        .frag_id  = data[5],                     // 分片标识
-        .recv_wnd = ReadBigEndianU16(data, 6),   // 对端窗口通告
-        .ts       = ReadBigEndianU32(data, 8),   // 发送方时间戳
-        .sn       = ReadBigEndianU32(data, 12),  // 序列号
-        .una      = ReadBigEndianU32(data, 16),  // 累积确认号
-        .len      = ReadBigEndianU32(data, 20)   // 有效载荷长度
-    }
+    header = Header{}
+    header.conv     = ReadBigEndianU32(data, 0)   // 会话标识
+    header.cmd      = data[4]                     // 命令字
+    header.frag_id  = data[5]                     // 分片标识
+    header.recv_wnd = ReadBigEndianU16(data, 6)   // 对端窗口通告
+    header.ts       = ReadBigEndianU32(data, 8)   // 发送方时间戳
+    header.sn       = ReadBigEndianU32(data, 12)  // 序列号
+    header.una      = ReadBigEndianU32(data, 16)  // 累积确认号
+    header.len      = ReadBigEndianU32(data, 20)  // 有效载荷长度
+    RETURN header
 ```
 
 ---

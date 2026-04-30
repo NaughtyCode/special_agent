@@ -167,6 +167,10 @@ CLASS ConfigurationManager:
         RETURN true
 
     // 从内存中的JSON字符串加载 (用于单元测试/嵌入式场景)
+    // 设计注意: LoadFromString与LoadFromFile的核心逻辑 (反序列化→验证→覆盖→原子存储)
+    // 完全重复,仅输入源不同。建议提取为共享的私有方法:
+    //   PRIVATE FUNCTION ApplyConfigFromJson(json_root: JsonValue) -> bool
+    // 以消除代码重复并降低维护成本。
     FUNCTION LoadFromString(json_string: const std::string&) -> bool:
         // 步骤1: JSON解析
         json_root = ParseJSON(json_string)
@@ -255,6 +259,8 @@ CLASS ConfigurationManager:
         IF json.Has("metrics_output"):
             out.metrics_output = json["metrics_output"].AsString()
         IF json.Has("max_worker_threads"):
+            // 注意: AsInt()返回int,赋值给uint32_t时需确保非负
+            // 生产代码应使用AsUInt()或添加范围检查 (0 <= val <= UINT32_MAX)
             out.max_worker_threads = json["max_worker_threads"].AsInt()
         RETURN true
 
@@ -358,7 +364,13 @@ CLASS ConfigurationManager:
             DeserializeReconnectConfig(json["reconnect"], out.reconnect)
         RETURN true
 
-    PRIVATE FUNCTION DeserializeReconnectConfig(json: JsonValue, out: ReconnectConfig&) -> void:
+    // 注意: ClientEndpointConfig使用ReconnectConfig (含enabled:bool标志),
+    //       而Client类使用std::optional<ReconnectStrategy> (nullopt=禁用重连)。
+    //       这两种表示方式描述同一概念 (启用/禁用重连的参数集);
+    //       建议后续版本统一为一种表示以减少转换代码。
+    //       当前处理: DeserializeReconnectConfig从JSON填充ReconnectConfig,
+    //       调用方(Client::Config构造)负责将ReconnectConfig转为std::optional<ReconnectStrategy>
+    //       (enabled=false → std::nullopt, enabled=true → ReconnectStrategy{...})
         IF json IS null: RETURN
         IF NOT json.IsObject(): RETURN
         IF json.Has("enabled"):
@@ -435,9 +447,8 @@ CLASS ConfigurationManager:
     // 阻塞性错误检查 (导致加载失败)
     PRIVATE FUNCTION HasBlockingErrors(config: SystemConfigPtr) -> bool:
         // - 文件解析失败 (已在Deserialize阶段返回false)
-        // - Server和Client同时启用但共享同一端口 (> 1个绑定冲突)
+        // - Server和Client同时启用但绑定地址冲突 (只有两者都启用时才检查)
         // - 必填字段缺失 (如Server enabled但未配置listen_port)
-        // 此处仅举例:
         IF config->server.enabled AND config->client.enabled:
             // 检查Server绑定地址与Client本地绑定地址是否冲突
             // (非Server监听端口与Client远程端口 — 两者语义不同,不冲突)

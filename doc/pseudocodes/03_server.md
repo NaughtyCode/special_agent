@@ -18,6 +18,11 @@
 //       线程安全: 所有操作在所属EventLoop线程执行,无需内部锁
 // ============================================================
 CLASS Server:
+    // -------------------- 常量 --------------------
+    CONST kMaxConsecutiveRecvErrors: int = 16   // 连续RecvFrom错误上限 (防止Socket损坏导致忙等)
+                                                 // 与Client::kMaxConsecutiveRecvErrors独立定义,
+                                                 // 二者使用场景相同 (循环读取中防死循环)
+
     // -------------------- 类型别名 --------------------
     USING NewSessionHandler     = std::move_only_function<void(std::shared_ptr<Session>)>
     USING SessionEvictedHandler = std::move_only_function<void(uint32_t conv, EvictReason)>
@@ -305,6 +310,8 @@ CLASS Server:
         )
 
     // 从数据报头部提取路由键 (协议相关,取决于协议引擎类型)
+    CONST MIN_HEADER_SIZE: size_t = 24   // KCP最小头部24字节 (conv+cmd+frag+wnd+ts+sn+una+len)
+                                         // QUIC最小1字节但由ProtocolEngine::ExtractRoutingKey处理
     PRIVATE FUNCTION ExtractRoutingKey(
             data: const uint8_t*, len: size_t
     ) -> std::optional<uint32_t>:
@@ -317,7 +324,10 @@ CLASS Server:
         // ProtocolEngine::ExtractRoutingKey(data, len) 以委托协议特定解析
         IF len < MIN_HEADER_SIZE: RETURN std::nullopt
         IF config_.session_config.engine_type == EngineType::kEngineQUIC:
-            RETURN engine_.ExtractRoutingKey(data, len)
+            // QUIC的Connection ID提取逻辑复杂(长头/短头格式不同),委托ProtocolEngine静态方法解析
+            // 注意: ProtocolEngine::ExtractRoutingKey是静态方法,不依赖引擎实例;
+            //       定义在 protocol_engine.h 中,各引擎实现提供对应重载
+            RETURN ProtocolEngine::ExtractRoutingKey(data, len)
         // KCP (默认): conv位于偏移0,4字节大端无符号整数
         RETURN ReadBigEndianU32(data, 0)
 
