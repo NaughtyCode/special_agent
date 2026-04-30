@@ -317,7 +317,7 @@ CodeAgent (CrewLeader)
 返回 CrewResult.mission_summary 给用户
 ```
 
-## 7. Crew 使用示例
+## 6. Crew 使用示例
 
 任何特化 Agent 均可通过继承自 BaseAgent 的 `form_crew()` 和 `launch_crew()` 方法成为 **CrewLeader**，无需额外覆写。
 
@@ -328,14 +328,17 @@ CodeAgent (CrewLeader)
 # CodeAgent 的 LLM 识别到任务需多领域协作 (代码 + 文档 + 测试),
 # 通过 Function Calling 调用 launch_crew:
 
-# CodeAgent 在 register_tools() 中额外注册
+# CodeAgent 在 register_tools() 中额外注册 CrewTool,
+# 使其 LLM 可通过 Function Calling 发起 Crew 编排。
+# (以下为 §3.1 中 register_tools() 的扩展版本, 新增最后一行)
 def register_tools(self) -> None:
+    # ── 基础 Tool (与 §3.1 相同) ──
     self.tool_manager.register(ReadFileTool())
     self.tool_manager.register(WriteFileTool())
     self.tool_manager.register(SearchCodeTool())
     self.tool_manager.register(RunShellTool(requires_confirmation=True))
     self.tool_manager.register(ListFilesTool())
-    # 注册 launch_crew 作为可用 Tool — LLM 可在 ReAct 中调用
+    # ── Crew 编排 Tool (新增) ──
     self.tool_manager.register(CrewTool(agent=self))
 
 # CrewTool 将 launch_crew() 包装为 Tool,
@@ -367,7 +370,7 @@ def register_tools(self) -> None:
 # }
 ```
 
-## 8. Agent 配置最佳实践
+## 7. Agent 配置最佳实践
 
 | Agent | 推荐 temperature | 推荐 max_iterations | 备注 |
 |-------|-----------------|--------------------|------|

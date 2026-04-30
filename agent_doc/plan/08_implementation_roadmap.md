@@ -25,7 +25,7 @@
 | 2.4 | 实现 ToolManager (含安全策略) | `agent/core/tool_manager.py` | 2.3 |
 | 2.5 | 实现 MatchStrategy 体系 (Exact/Fuzzy/Semantic/Agent) | `agent/strategies/match_strategy.py` | 2.4 |
 | 2.6 | 实现 AgentRegistry + AgentPool | `agent/core/agent_registry.py`, `agent_pool.py` | 无 |
-| 2.6a | 实现 CrewOrchestrator (Plan/Execute/Aggregate + 三种执行策略) | `agent/core/crew_orchestrator.py` | 1.7, 2.6 |
+| 2.6a | 实现 CrewOrchestrator (Plan/Execute/Aggregate + 三种执行策略) | `agent/core/crew_orchestrator.py` | 1.4, 1.7, 2.6 |
 | 2.7 | 实现 CompressStrategy 体系 (Sliding/Summarize/Hybrid) | `agent/strategies/compress_strategy.py` | 2.1 |
 | 2.8 | 实现 ContextStore (含压缩策略) | `agent/core/context_store.py` | 2.1, 2.7 |
 | 2.9 | 实现 ReActEngine (注入策略 + 终止条件) | `agent/core/react_engine.py` | 1.7, 2.2, 2.4, 2.5, 2.6, 2.8 |
@@ -91,7 +91,7 @@ Phase 2 (Agent 基类与 ReAct)           │
   ├─ 2.4 ToolManager ← 2.3            │
   ├─ 2.5 MatchStrategy ← 2.4          │
   ├─ 2.6 AgentRegistry + AgentPool    │
-  ├─ 2.6a CrewOrchestrator ← 1.7,2.6  │
+  ├─ 2.6a CrewOrchestrator ← 1.4,1.7,2.6  │
   ├─ 2.7 CompressStrategy ← 2.1       │
   ├─ 2.8 ContextStore ← 2.1,2.7      │
   ├─ 2.9 ReActEngine ← 1.7,2.2,2.4,2.5,2.6,2.8

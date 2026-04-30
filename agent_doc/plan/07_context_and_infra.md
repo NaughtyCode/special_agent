@@ -151,6 +151,7 @@ class EventBus:
     - LLMCallEvent: BEFORE_CALL / AFTER_CALL
     - ReActIterationEvent: ITERATION_START / ITERATION_END
     - CrewLifecycleEvent: PLANNED / STARTED / MEMBER_STARTED / MEMBER_COMPLETED / MEMBER_FAILED / COMPLETED / FAILED
+      (每个 Crew 事件携带 CrewEvent 负载数据, 含 crew_id, member_name, task_id 等上下文)
     """
 
     def subscribe(self, event_type: type, handler: Callable) -> None:
@@ -199,9 +200,13 @@ class Config:
     agent_default_name: str = "RootAgent"   # 默认 Agent 名称
 
     # ── Crew ────────────────────────────────────────
+    # Crew 团队编排相关配置 — CrewOrchestrator 在初始化时读取这些值
     crew_max_parallel: int = 4              # Crew 最大并行成员数 (CREW_MAX_PARALLEL)
+                                              # 控制 PARALLEL 和 DAG 策略下的最大并发 Agent 数
     crew_max_iterations: int = 3            # Crew 任务分解最大 LLM 迭代 (CREW_MAX_ITERATIONS)
+                                              # plan_crew() 调用 LLM 分解任务时的最大重试次数
     crew_plan_temperature: float = 0.4      # Crew 任务分解时的 LLM 温度 (CREW_PLAN_TEMPERATURE)
+                                              # 较低的温度 (0.3-0.5) 可提高分解的稳定性和一致性
 
     # ── 上下文 ──────────────────────────────────────
     context_max_tokens: int = 64000         # 上下文窗口 Token 上限 (CONTEXT_MAX_TOKENS)

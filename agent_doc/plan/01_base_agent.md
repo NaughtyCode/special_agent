@@ -37,7 +37,9 @@ class BaseAgent(ABC):
     tool_manager: ToolManager       # Tool 管理器
     agent_registry: AgentRegistry   # Agent 注册中心 (用于拉起子 Agent)
     agent_pool: AgentPool           # Agent 实例池
-    crew_orchestrator: CrewOrchestrator  # 团队编排引擎 (组建并执行 Agent 团队)
+    crew_orchestrator: CrewOrchestrator  # 团队编排引擎 — 任何 Agent 均可通过此引擎
+                                          # 动态组建并领导 Agent 团队 (Crew),
+                                          # 支持串行/并行/DAG 三种执行策略
 
     # ── 上下文 ───────────────────────────────────────
     context_store: ContextStore     # 上下文存储 (消息历史)

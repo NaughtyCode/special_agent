@@ -399,12 +399,23 @@ class SubTask:
     由 CrewOrchestrator 分解出的子任务。
 
     每个子任务描述一个独立的、可分配给特定 Agent 的工作单元。
+
+    设计要点:
+    - task_id 使用 UUID 保证全局唯一, 用于依赖追踪和日志关联
+    - required_tags 是 Agent 匹配的关键依据 — Agent 的 tags 与 required_tags
+      的重叠度决定匹配得分
+    - dependencies 仅在 DAG 策略下使用, 为空列表表示无依赖可立即执行
+    - context 用于跨子任务传递数据, 前一子任务的 AgentResult 会注入为
+      后续子任务的 context
     """
-    task_id: str                        # 子任务唯一标识 (UUID)
-    description: str                    # 子任务描述 (Agent 据此理解工作内容)
-    required_tags: list[str]            # 所需 Agent 能力标签 (用于匹配)
-    dependencies: list[str]             # 依赖的 task_id 列表 (DAG 模式)
-    context: dict | None = None         # 传递的上下文数据
+    task_id: str                        # 子任务唯一标识 (UUID v4)
+    description: str                    # 子任务描述 (Agent 据此理解工作内容,
+                                          # 应包含明确的输入/输出/验收标准)
+    required_tags: list[str]            # 所需 Agent 能力标签 (用于匹配,
+                                          # 如 ["code", "python", "refactor"])
+    dependencies: list[str]             # 依赖的 task_id 列表 (DAG 模式使用,
+                                          # 为空表示无依赖可立即执行)
+    context: dict | None = None         # 传递的上下文数据 (来自前置任务结果)
 
 @dataclass
 class CrewMember:
@@ -413,13 +424,20 @@ class CrewMember:
 
     由 CrewOrchestrator 在 plan_crew 阶段创建，
     在 execute_crew 阶段由 AgentPool 获取实例后填充 agent_instance。
+
+    生命周期: PENDING → RUNNING → DONE / FAILED
+    - PENDING: 已分配子任务, 等待执行
+    - RUNNING: Agent 正在执行子任务 (已从 AgentPool 获取实例)
+    - DONE:    Agent 成功完成子任务, result 包含 AgentResult
+    - FAILED:  Agent 执行失败 (异常或超时), result 包含错误信息
     """
-    agent_name: str                     # 匹配到的 Agent 名称
-    agent_cls: type[BaseAgent] | None = None  # Agent 类引用 (用于延迟实例化)
-    agent_instance: BaseAgent | None = None   # Agent 实例 (执行时填充)
-    task: SubTask | None = None         # 分配的子任务
+    agent_name: str                     # 匹配到的 Agent 名称 (如 "CodeAgent")
+    agent_cls: type[BaseAgent] | None = None  # Agent 类引用 (用于延迟实例化,
+                                                # 避免在 plan 阶段就创建重量实例)
+    agent_instance: BaseAgent | None = None   # Agent 实例 (执行时由 AgentPool 填充)
+    task: SubTask | None = None         # 分配的子任务 (含任务描述和依赖信息)
     status: str = "PENDING"             # PENDING → RUNNING → DONE / FAILED
-    result: AgentResult | None = None   # 执行结果
+    result: AgentResult | None = None   # 执行结果 (DONE/FAILED 时填充)
 
 @dataclass
 class AgentCrew:
@@ -427,13 +445,21 @@ class AgentCrew:
     由 CrewLeader 组建的一支 Agent 团队。
 
     包含团队标识、任务描述 (mission)、成员列表与执行状态。
+    由 plan_crew() 创建 (status=ASSEMBLED), 由 execute_crew() 执行。
+
+    生命周期: ASSEMBLED → RUNNING → COMPLETED / FAILED
+    - ASSEMBLED: 已规划完成, 成员已分配, 等待执行
+    - RUNNING:   正在执行 (至少一个成员处于 RUNNING 状态)
+    - COMPLETED: 全部成员执行成功
+    - FAILED:    至少一个成员执行失败 (不可恢复)
     """
-    crew_id: str                        # Crew 唯一标识 (UUID)
-    lead_agent_name: str                # CrewLeader (发起方 Agent) 名称
-    mission: str                        # 团队使命 (原始任务描述)
-    members: list[CrewMember]           # 团队成员列表
+    crew_id: str                        # Crew 唯一标识 (UUID v4, 用于日志/审计追踪)
+    lead_agent_name: str                # CrewLeader (发起方 Agent) 名称,
+                                          # 用于记录发起者便于审计
+    mission: str                        # 团队使命 (原始任务描述, 作为 LLM 分解的输入)
+    members: list[CrewMember]           # 团队成员列表 (plan_crew 阶段填充)
     status: str = "ASSEMBLED"           # ASSEMBLED → RUNNING → COMPLETED / FAILED
-    created_at: float = 0.0             # 创建时间戳
+    created_at: float = 0.0             # 创建时间戳 (time.time(), 用于计算总耗时)
 
 @dataclass
 class CrewResult:
@@ -441,14 +467,21 @@ class CrewResult:
     Crew 执行结果 — 汇总所有成员结果。
 
     除聚合结果外, 保留每个成员的完整 AgentResult 用于调试和审计。
+
+    success 判定规则:
+    - True:  全部成员执行成功 (无异常), mission_summary 为完整的汇总报告
+    - False: 任一成员执行失败 (抛出未捕获异常或返回 error),
+             此时 mission_summary 包含已完成部分的结果 + 失败说明,
+             member_results 中可区分成功和失败的成员
     """
     success: bool                       # 整体是否成功 (全部子任务成功 = True)
     crew_id: str                        # 来源 Crew 的 ID
-    mission_summary: str                # LLM 汇总的团队使命报告
+    mission_summary: str                # LLM 汇总的团队使命报告 (失败时含错误说明)
     member_results: list[tuple[str, AgentResult]]  # (agent_name, result) 列表
     execution_order: list[str]          # 子任务执行顺序 (task_id 列表)
     total_duration_ms: float            # 总耗时 (毫秒)
     token_usage: TokenUsage             # 团队总 Token 用量
+    failed_members: list[str]           # 失败的成员 Agent 名称列表 (全部成功时为空)
 
 # ── 执行策略枚举 ──────────────────────────────────
 
@@ -479,6 +512,12 @@ class CrewOrchestrator:
 
     这是框架的核心扩展机制 — 任何特化 Agent 均可通过 CrewOrchestrator
     将复杂任务拆解并分派给一组更专业的 Agent 协同完成。
+
+    设计原则:
+    - 无状态: 所有状态存储在 AgentCrew 中, Orchestrator 本身不持有 Crew 状态
+    - 策略可替换: ExecutionStrategy 由调用方传入, 可扩展自定义策略
+    - LLM 驱动: 任务分解和结果聚合均使用 LLM, 依赖 LLM 的语义理解能力
+    - 事件驱动: 通过 EventBus 发布 Crew 生命周期事件, 便于监控和日志
     """
 
     # ── 依赖 ─────────────────────────────────────────
@@ -514,10 +553,11 @@ class CrewOrchestrator:
 
         内部流程:
         1. 构建分解 Prompt (含可用 Agent 列表与能力描述)
-        2. LLM 分析 mission, 输出结构化子任务列表 (JSON)
+        2. LLM 分析 mission (使用 self.plan_temperature 温度),
+           输出结构化子任务列表 (JSON)
         3. 每个子任务通过 AgentRegistry.match_agent() 匹配最佳 Agent
         4. 构建 AgentCrew (含 CrewMember 列表)
-        5. 发布 CrewLifecycleEvent.PLANNED
+        5. 发布 CrewLifecycleEvent.PLANNED (携带 CrewEvent 负载)
 
         返回已组建但尚未执行的 AgentCrew (status=ASSEMBLED)。
         """
@@ -531,33 +571,53 @@ class CrewOrchestrator:
         按指定策略执行 Crew。
 
         内部流程:
-        1. 发布 CrewLifecycleEvent.STARTED
+        1. 发布 CrewLifecycleEvent.STARTED (携带 CrewEvent 负载, 含 crew_id 和 strategy)
         2. 根据 strategy 分发到 _execute_sequential / _execute_parallel / _execute_dag
         3. 每个成员执行: AgentPool.acquire → agent.run(task) → AgentPool.release
+           (每个成员执行时发布 MEMBER_STARTED / MEMBER_COMPLETED / MEMBER_FAILED,
+            各携带 CrewEvent 负载含 crew_id, member_name, task_id)
         4. 汇总所有成员结果 → 调用 _aggregate_results
-        5. 发布 CrewLifecycleEvent.COMPLETED (或 FAILED)
+        5. 发布 CrewLifecycleEvent.COMPLETED 或 FAILED (携带 CrewEvent 负载)
         6. 返回 CrewResult
         """
 
     def _execute_sequential(self, crew: AgentCrew) -> list[tuple[str, AgentResult]]:
         """
         串行执行 — 按 members 列表顺序依次执行每个成员。
-        前一成员的结果 (final_answer) 作为后一成员的 context 传入。
-        适用于有强顺序依赖的任务链。
+
+        前一成员的结果 (final_answer) 自动作为后一成员的 task.context 传入,
+        确保信息在任务链中流动。适用于有强顺序依赖的任务链。
+
+        若任一成员失败, 默认继续执行后续成员 (不立即终止),
+        失败信息会传递给后续成员作为上下文参考。
         """
 
     def _execute_parallel(self, crew: AgentCrew,
                           max_parallel: int) -> list[tuple[str, AgentResult]]:
         """
         并行执行 — 并发执行所有成员 (受 max_parallel 限制)。
-        使用 concurrent.futures.ThreadPoolExecutor 实现。
-        适用于成员间无依赖的独立子任务。
+
+        使用 concurrent.futures.ThreadPoolExecutor 实现并发控制。
+        每个成员独立执行, 不共享 context (因为任务间无依赖)。
+        适用于成员间无依赖的独立子任务 (如同时搜索多个信息源)。
+
+        返回结果按提交顺序排列, 与 members 列表顺序一致。
         """
 
     def _execute_dag(self, crew: AgentCrew) -> list[tuple[str, AgentResult]]:
         """
         DAG 执行 — 按依赖关系拓扑排序, 无依赖的成员可并行。
-        每完成一个成员, 检查并释放依赖它的后续成员。
+
+        算法:
+        1. 构建依赖图 (SubTask.dependencies → task_id → 被哪些 task 依赖)
+        2. 找出所有入度为 0 的成员, 加入就绪队列
+        3. 并发执行就绪队列中的所有成员
+        4. 每完成一个成员, 将其结果传递给所有依赖它的后续成员 (注入 context),
+           并将后续成员中所有依赖已满足的加入就绪队列
+        5. 重复步骤 3-4 直到所有成员完成
+
+        若某成员失败, 依赖它的后续成员仍会执行 (携带失败信息作为 context),
+        不会因单点失败导致整个 DAG 阻塞。
         """
 
     # ── Aggregate: 结果聚合 ───────────────────────────
@@ -565,10 +625,12 @@ class CrewOrchestrator:
                            results: list[tuple[str, AgentResult]]) -> CrewResult:
         """
         汇总所有成员结果:
-        1. 将所有 member final_answer 拼接为上下文
+        1. 将所有 member final_answer 拼接为上下文 (失败成员标注其错误)
         2. 调用 LLM 生成统一的 mission_summary
+           (使用默认 temperature, 非 plan_temperature, 因为聚合任务是总结性工作)
         3. 计算 total_duration_ms 和 total token_usage
-        4. 判定整体 success (全部成员 success=True)
+        4. 判定整体 success (全部成员 success=True 且无异常),
+           收集 failed_members 列表
         """
 ```
 
@@ -595,6 +657,32 @@ class CrewLifecycleEvent(Enum):
     MEMBER_FAILED = "member_failed"
     COMPLETED = "completed"
     FAILED = "failed"
+
+@dataclass
+class CrewEvent:
+    """
+    Crew 生命周期事件的负载数据 — 随 CrewLifecycleEvent 发布到 EventBus。
+
+    不同事件类型携带不同的字段子集 (未携带的字段为 None):
+    - PLANNED:          crew_id, lead_agent_name, member_count
+    - STARTED:          crew_id, strategy
+    - MEMBER_STARTED:   crew_id, member_name, task_id
+    - MEMBER_COMPLETED: crew_id, member_name, task_id, duration_ms
+    - MEMBER_FAILED:    crew_id, member_name, task_id, error_message
+    - COMPLETED:        crew_id, total_duration_ms, token_usage
+    - FAILED:           crew_id, error_message, partial_results
+    """
+    event_type: CrewLifecycleEvent           # 事件类型
+    crew_id: str                             # Crew 唯一标识 (所有事件必带)
+    lead_agent_name: str | None = None       # CrewLeader 名称 (PLANNED)
+    member_name: str | None = None           # 成员 Agent 名称 (MEMBER_* 事件)
+    task_id: str | None = None               # 子任务 ID (MEMBER_* 事件)
+    member_count: int = 0                    # 成员总数 (PLANNED)
+    strategy: str | None = None              # 执行策略 (STARTED)
+    duration_ms: float = 0.0                 # 耗时 (MEMBER_COMPLETED, COMPLETED)
+    token_usage: TokenUsage | None = None    # Token 用量 (COMPLETED)
+    error_message: str | None = None         # 错误信息 (MEMBER_FAILED, FAILED)
+    partial_results: list | None = None      # 部分成功结果 (FAILED)
 ```
 
 ### 9.4 Crew 编排流程
@@ -618,7 +706,10 @@ CrewLeader (任意特化 Agent)
    │           └─ DAG:        [SearchAgent] → [CodeAgent] → [ShellAgent]
    │                                  └──────────────→ [DocAgent]
    │
-   ├─ 4. 聚合结果
+   ├─ 4. 写入上下文
+   │     └─ launch_crew() 将 CrewResult.mission_summary 写入 ContextStore
+   │
+   ├─ 5. 聚合结果
    │     └─ LLM 汇总所有 member.final_answer → mission_summary
    │
    ▼
@@ -704,23 +795,34 @@ class CrewTool(BaseTool):
         3. 将 CrewResult 转换为 ToolResult:
            - success → output = crew_result.mission_summary
            - failure → error = 失败描述
+        4. 异常时捕获并包装为失败 ToolResult, 避免中断 ReAct 循环
         """
         mission = kwargs["mission"]
         strategy_str = kwargs.get("strategy", "sequential")
         strategy = ExecutionStrategy(strategy_str)
         max_parallel = kwargs.get("max_parallel")
 
-        crew_result = self._agent.launch_crew(
-            mission=mission,
-            strategy=strategy,
-            max_parallel=max_parallel
-        )
+        try:
+            crew_result = self._agent.launch_crew(
+                mission=mission,
+                strategy=strategy,
+                max_parallel=max_parallel
+            )
 
-        return ToolResult(
-            success=crew_result.success,
-            output=crew_result.mission_summary,
-            data=crew_result,          # 保留完整 CrewResult 供程序使用
-            tool_name=self.name,
-            duration_ms=crew_result.total_duration_ms
-        )
+            return ToolResult(
+                success=crew_result.success,
+                output=crew_result.mission_summary,
+                data=crew_result,          # 保留完整 CrewResult 供程序使用
+                tool_name=self.name,
+                duration_ms=crew_result.total_duration_ms
+            )
+        except Exception as e:
+            # Crew 编排失败时, 将错误信息作为 Observation 反馈给 LLM,
+            # 使 LLM 可以选择重试或采用替代方案
+            return ToolResult(
+                success=False,
+                output=f"Crew 编排失败: {e}",
+                error=str(e),
+                tool_name=self.name
+            )
 ```

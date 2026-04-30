@@ -179,7 +179,7 @@ RootAgent ──→ BaseAgent ──→ ReActEngine ──→ LLMClient ──�
                 ├─→ ContextStore │
                 ├─→ AgentRegistry│
                 ├─→ AgentPool    │
-                ├─→ CrewOrchestrator ──→ AgentRegistry + AgentPool + LLMClient
+                ├─→ CrewOrchestrator ──→ AgentRegistry + AgentPool + LLMClient + EventBus
                 └─→ EventBus     │
                                  │
                   匹配策略注入 ──┘
