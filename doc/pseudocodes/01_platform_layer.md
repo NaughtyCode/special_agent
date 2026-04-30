@@ -17,10 +17,10 @@ CLASS EventLoop:
     // -------------------- 嵌套类型 --------------------
     // IO事件掩码 (位标志,可组合)
     FLAGS IOMask:
-        kReadable  = 0x01   // 可读事件
-        kWritable  = 0x02   // 可写事件
-        kError     = 0x04   // 错误事件
-        kEdgeTriggered = 0x10  // 边缘触发 (推荐用于高性能场景)
+        kReadable      = 0x01   // 可读事件
+        kWritable      = 0x02   // 可写事件
+        kError         = 0x04   // 错误事件
+        kEdgeTriggered = 0x10   // 边缘触发 (推荐用于高性能场景)
 
     // 统一的事件描述符 (跨平台句柄抽象)
     STRUCT EventDesc:
@@ -43,8 +43,8 @@ CLASS EventLoop:
             CASE kAutoDetect:
                 impl_ = PlatformDetect::BestAvailable()
 
-        // 创建内部唤醒机制 (用于跨线程唤醒事件循环)
-        // 不同平台采用不同实现:
+        // 创建内部唤醒通道 (用于跨线程唤醒阻塞中的事件循环)
+        // 各平台实现:
         //   Linux → eventfd
         //   macOS/BSD → pipe 或 kqueue user event
         //   Windows → PostQueuedCompletionStatus
@@ -52,19 +52,20 @@ CLASS EventLoop:
 
     DESTRUCTOR ~EventLoop():
         Stop()
-        impl_.reset()
+        impl_.Reset()
 
     // -------------------- 生命周期管理 --------------------
 
-    // 启动事件循环 (阻塞调用,直到Stop被调用)
+    // 启动事件循环 (阻塞调用,直到外部调用Stop)
     FUNCTION Run() -> void:
         state_ = kRunning
         WHILE state_ == kRunning:
-            // 步骤1: 计算等待超时 — 取最近定时器剩余时间
-            timeout_ms = timer_queue_.GetNextTimeout()
+            // 步骤1: 获取最近定时器剩余时间作为IO等待上限
+            //   std::nullopt 表示无定时器 → 可无限等待,直到IO事件到达
+            timeout_opt = timer_queue_.GetNextTimeout()
 
             // 步骤2: 等待IO事件就绪 (委托给平台实现)
-            event_batch = impl_.WaitForEvents(timeout_ms, kMaxEventsPerBatch)
+            event_batch = impl_.WaitForEvents(timeout_opt, kMaxEventsPerBatch)
 
             // 步骤3: 分派就绪事件到注册的Handler
             FOR EACH event IN event_batch:
@@ -78,7 +79,7 @@ CLASS EventLoop:
                 IF event.mask HAS kError:
                     handler.OnError(event.error_code)
 
-            // 步骤4: 处罚已到期的定时器回调
+            // 步骤4: 触发已到期的定时器回调
             timer_queue_.FireExpired(Clock::NowMs())
 
             // 步骤5: 批量执行投递的异步任务
@@ -87,67 +88,65 @@ CLASS EventLoop:
     // 停止事件循环 (线程安全,可从任何线程调用)
     FUNCTION Stop() -> void:
         state_ = kStopped
-        WakeUp()  // 如果Run正在阻塞等待,将其唤醒
+        WakeUp()  // 如果Run正在阻塞等待IO,立即唤醒以退出循环
 
     // -------------------- IO事件管理 --------------------
 
     // 注册文件描述符/句柄及其关注的事件类型
+    // handler的生命周期由调用方管理,必须保证在Unregister前有效
     FUNCTION Register(
             desc: EventDesc,
             mask: IOMask,
             handler: IEventHandler*
     ) -> void:
-        // 将 (desc, mask, handler) 三元组注册到底层IO复用器
-        // handler的生命周期由调用方管理,必须保证在Unregister之前有效
         impl_.Register(desc, mask, handler)
 
     // 修改已注册描述符的关注事件掩码
     FUNCTION Modify(desc: EventDesc, new_mask: IOMask) -> void:
         impl_.Modify(desc, new_mask)
 
-    // 取消注册
+    // 取消注册 (不再接收此描述符的事件通知)
     FUNCTION Unregister(desc: EventDesc) -> void:
         impl_.Unregister(desc)
 
     // -------------------- 任务投递 --------------------
 
-    // 向EventLoop线程安全地投递一个闭包任务
-    // 常用于: 跨线程操作Session / 延迟执行 / 异步回调
+    // 向EventLoop线程安全地投递一个可移动闭包
+    // 常用于: 跨线程操作Session / 延迟执行 / 异步回调通知
     FUNCTION PostTask(task: std::move_only_function<void()>) -> void:
         pending_tasks_.Push(std::move(task))
-        WakeUp()  // 如果EventLoop正在阻塞等待IO,立即唤醒以处理任务
+        WakeUp()  // 如果EventLoop正在阻塞,唤醒它以立即处理任务
 
     // -------------------- 定时器管理 --------------------
 
-    // 添加一次性定时器
+    // 添加一次性定时器,到时后执行callback一次
     FUNCTION AddTimer(
             delay_ms: uint32_t,
             callback: std::move_only_function<void()>
     ) -> TimerHandle:
         RETURN timer_queue_.Add(delay_ms, std::move(callback), /*repeat=*/false)
 
-    // 添加周期性定时器
+    // 添加周期性定时器,每隔interval_ms重复执行callback
     FUNCTION AddPeriodicTimer(
             interval_ms: uint32_t,
             callback: std::move_only_function<void()>
     ) -> TimerHandle:
         RETURN timer_queue_.Add(interval_ms, std::move(callback), /*repeat=*/true)
 
-    // 取消定时器 (延迟删除,下次Fire时跳过)
+    // 取消定时器 (延迟删除: 仅标记取消,在下次Fire时跳过并清理)
     FUNCTION CancelTimer(handle: TimerHandle) -> void:
         timer_queue_.Cancel(handle)
 
-    // -------------------- 内部唤醒机制 --------------------
+    // -------------------- 私有 --------------------
     PRIVATE FUNCTION WakeUp() -> void:
-        // 向wakeup_channel_写入一个标记,将阻塞的WaitForEvents唤醒
-        // 此操作线程安全,且开销很小
+        // 向wakeup_channel_写入标记,唤醒正在阻塞的WaitForEvents调用
         impl_.WakeUp(wakeup_channel_)
 
-    PRIVATE MEMBER impl_: std::unique_ptr<IOBackendImpl>  // 平台相关实现 (Pimpl)
+    PRIVATE MEMBER impl_: std::unique_ptr<IOBackendImpl>  // 平台实现 (Pimpl惯用法)
     PRIVATE MEMBER state_: RunState = kStopped
     PRIVATE MEMBER pending_tasks_: TaskQueue               // 异步任务队列
     PRIVATE MEMBER timer_queue_: TimerQueue                // 定时器队列
-    PRIVATE MEMBER wakeup_channel_: WakeupHandle           // 跨线程唤醒句柄
+    PRIVATE MEMBER wakeup_channel_: WakeupHandle           // 唤醒通道句柄
 ```
 
 ---
@@ -158,24 +157,47 @@ CLASS EventLoop:
 // ============================================================
 // 类名: DatagramSocket
 // 描述: 非阻塞数据报Socket的RAII封装
-//       抽象底层为通用Datagram,可适配UDP/UDPLite/Unix Domain Dgram
+//       适配UDP/UDPLite/Unix Domain Dgram,统一为Datagram语义
 // ============================================================
 CLASS DatagramSocket:
     // -------------------- 嵌套类型 --------------------
-    // Socket地址 (协议无关的地址表示)
+
+    // 协议无关的地址表示
     STRUCT Address:
         ip: std::string         // IPv4/IPv6地址字符串 或 Unix Domain路径
         port: uint16_t          // 端口 (Unix Domain时忽略)
         family: AddressFamily   // kIPv4 / kIPv6 / kUnixDomain
 
-    // 接收结果
+        OPERATOR ==(other: Address) -> bool:
+            RETURN ip == other.ip AND port == other.port AND family == other.family
+
+        OPERATOR !=(other: Address) -> bool:
+            RETURN NOT (*this == other)
+
+        STATIC FUNCTION Any() -> Address:
+            RETURN Address{.ip = "0.0.0.0", .port = 0, .family = kIPv4}
+
+        STATIC FUNCTION From(ip: string, port: uint16_t) -> Address:
+            RETURN Address{.ip = ip, .port = port, .family = DetectFamily(ip)}
+
+    // 接收结果: 数据指针指向调用方传入的缓冲区
+    // 调用方必须在RecvResult生命周期内保持buffer有效
     STRUCT RecvResult:
-        // 注意: data字段指向调用方传入的缓冲区,非独立内存
-        // 调用方需在使用完数据后自行管理缓冲区的生命周期
-        data: const uint8_t*      // 数据指针 (生命周期与RecvFrom的buffer参数一致)
+        data: const uint8_t*      // 数据指针 (生命周期与RecvFrom的buffer一致)
         len: size_t               // 实际接收的数据字节数
         sender: Address           // 数据报来源地址
-        timestamp_ms: uint64_t    // 接收时间戳 (用于精确RTT计算)
+        timestamp_ms: uint64_t    // 接收时刻的时间戳 (用于RTT精确计算)
+
+    // -------------------- 配置结构 --------------------
+    STRUCT SocketConfig:
+        reuse_addr: bool = true               // SO_REUSEADDR (快速重启)
+        recv_buf_bytes: uint32_t = 256*1024   // SO_RCVBUF
+        send_buf_bytes: uint32_t = 256*1024   // SO_SNDBUF
+        dscp: uint8_t = 0                     // DSCP/TOS (QoS标记, 0=默认)
+        ttl: uint8_t = 64                     // TTL
+
+        STATIC FUNCTION Default() -> SocketConfig:
+            RETURN SocketConfig{}
 
     // -------------------- 构造与析构 --------------------
     CONSTRUCTOR DatagramSocket(
@@ -184,48 +206,54 @@ CLASS DatagramSocket:
             config: SocketConfig = SocketConfig::Default()
     ):
         event_loop_ = event_loop
+        config_ = config
 
-        // 创建Socket并设置非阻塞模式
+        // 创建数据报Socket,设为非阻塞模式
         fd_ = ::socket(bind_addr.family.ToSystem(), SOCK_DGRAM, 0)
+        IF fd_ < 0:
+            THROW SocketException("socket() failed", SocketError::FromErrno(errno))
         SetNonBlocking(fd_, true)
 
-        // 通用Socket选项配置 (从config中读取,无硬编码值)
-        SetReuseAddress(fd_, config.reuse_addr)
-        SetRecvBufferSize(fd_, config.recv_buf_bytes)
-        SetSendBufferSize(fd_, config.send_buf_bytes)
-        // 可选: 设置TOS/DSCP (QoS标记), TTL, 等
+        // 通用Socket选项 (从config读取,无硬编码)
+        SetReuseAddress(fd_, config_.reuse_addr)
+        SetRecvBufferSize(fd_, config_.recv_buf_bytes)
+        SetSendBufferSize(fd_, config_.send_buf_bytes)
+        // 可选: 设置TOS/DSCP、TTL、MULTICAST_LOOP 等
 
-        // 绑定到指定地址 (port=0 则由OS自动分配)
         Bind(fd_, bind_addr)
 
     DESTRUCTOR ~DatagramSocket():
         IF fd_ IS VALID:
-            CloseSocket(fd_)
+            ::close(fd_)
 
-    MOVABLE_ONLY(DatagramSocket)   // 禁用拷贝,允许移动
+    // 禁止拷贝,允许移动
+    DatagramSocket(const DatagramSocket&) = delete
+    DatagramSocket& operator=(const DatagramSocket&) = delete
+    DatagramSocket(DatagramSocket&& other) = default
+    DatagramSocket& operator=(DatagramSocket&& other) = default
 
     // -------------------- 数据收发 --------------------
 
-    // 非阻塞发送数据到指定远端地址,立即返回实际发送字节数或错误
+    // 非阻塞发送,立即返回发送字节数或错误码
     FUNCTION SendTo(
-            data: const uint8_t*,    // [in]  待发送数据
-            len: size_t,             // [in]  数据长度
-            dest: Address            // [in]  目标地址
+            data: const uint8_t*,    // [in] 待发送数据
+            len: size_t,             // [in] 数据长度
+            dest: Address            // [in] 目标地址
     ) -> std::expected<int, SocketError>:
-        // 非阻塞sendto,返回实际发送字节数
         sent = ::sendto(fd_, data, len, MSG_DONTWAIT,
                         dest.ToSystemSockaddr(), dest.SizeOfSockaddr())
         IF sent >= 0:
             RETURN sent
         IF errno IS EAGAIN OR errno IS EWOULDBLOCK:
-            RETURN SocketError::kWouldBlock     // 发送缓冲区满,稍后重试
-        RETURN SocketError::FromErrno(errno)    // 其他错误
+            RETURN std::unexpected(SocketError::kWouldBlock)
+        RETURN std::unexpected(SocketError::FromErrno(errno))
 
-    // 非阻塞接收数据,无数据时返回 nullopt
+    // 非阻塞接收,无数据时返回 nullopt, Socket错误时返回错误码
+    // 注意: 需先调用 buffer.resize(capacity) 确保 capacity() == size()
     FUNCTION RecvFrom(
-            buffer: uint8_t*,        // [out] 接收缓冲区 (调用方提供)
-            buffer_capacity: size_t  // [in]  缓冲区容量
-    ) -> std::optional<RecvResult>:
+            buffer: uint8_t*,        // [out] 接收缓冲区
+            buffer_capacity: size_t  // [in]  缓冲区可用容量
+    ) -> std::expected<std::optional<RecvResult>, SocketError>:
         sender_addr: sockaddr_storage
         addr_len: socklen_t = sizeof(sender_addr)
         n = ::recvfrom(fd_, buffer, buffer_capacity, MSG_DONTWAIT,
@@ -238,14 +266,13 @@ CLASS DatagramSocket:
                 .timestamp_ms  = Clock::NowMs()
             }
         IF errno IS EAGAIN OR errno IS EWOULDBLOCK:
-            RETURN std::nullopt                    // 无就绪数据
-        // 其他错误: ISR中断/ICMP错误等 → 记录日志并返回nullopt
-        // 不对UDP"连接"产生致命影响
-        RETURN std::nullopt
+            RETURN std::nullopt                          // 无就绪数据
+        // 返回值区分: ICMP错误等不影响继续使用Socket,记录日志
+        RETURN std::unexpected(SocketError::FromErrno(errno))
 
-    // -------------------- 事件循环注册 --------------------
+    // -------------------- 事件循环集成 --------------------
 
-    // 设置可读回调 (通常在Socket可读时触发 → 调用RecvFrom)
+    // 注册可读通知回调 (Socket有数据到达 → EventLoop触发handler.OnReadable())
     FUNCTION SetReadHandler(handler: IEventHandler*) -> void:
         event_loop_.Register(
             EventLoop::EventDesc{fd_, Platform::Current()},
@@ -253,25 +280,27 @@ CLASS DatagramSocket:
             handler
         )
 
-    // 当发送缓冲区从满变为可写时 (kWouldBlock恢复), 可启用此通知
-    FUNCTION SetWriteHandler(handler: IEventHandler*) -> void:
-        // 按需注册,一般不需要 (仅在发送缓冲满后等待恢复时使用)
+    // 启用可写通知 (发送缓冲区从满→可用 转变时通知)
+    // 仅在发送遇到kWouldBlock后需要等待恢复时使用
+    FUNCTION EnableWriteNotifications(handler: IEventHandler*) -> void:
         event_loop_.Modify(
             EventLoop::EventDesc{fd_, Platform::Current()},
-            EventLoop::IOMask::kReadable | EventLoop::IOMask::kWritable,
+            EventLoop::IOMask::kReadable | EventLoop::IOMask::kWritable
+            | EventLoop::IOMask::kEdgeTriggered,
             handler
         )
 
-    // -------------------- 配置结构 --------------------
-    STRUCT SocketConfig:
-        reuse_addr: bool = true               // SO_REUSEADDR
-        recv_buf_bytes: uint32_t = 256*1024   // SO_RCVBUF
-        send_buf_bytes: uint32_t = 256*1024   // SO_SNDBUF
-        dscp: uint8_t = 0                     // QoS标记 (0=默认)
-        ttl: uint8_t = 64                     // TTL
+    // 关闭可写通知 (恢复为仅监听可读)
+    FUNCTION DisableWriteNotifications(handler: IEventHandler*) -> void:
+        event_loop_.Modify(
+            EventLoop::EventDesc{fd_, Platform::Current()},
+            EventLoop::IOMask::kReadable | EventLoop::IOMask::kEdgeTriggered,
+            handler
+        )
 
-        STATIC FUNCTION Default() -> SocketConfig:
-            RETURN SocketConfig{}
+    PRIVATE MEMBER fd_: int
+    PRIVATE MEMBER event_loop_: EventLoop*
+    PRIVATE MEMBER config_: SocketConfig
 ```
 
 ---
@@ -288,30 +317,40 @@ CLASS WorkerPool:
     PRIVATE MEMBER workers_: std::vector<Worker>
     PRIVATE MEMBER strategy_: DispatchStrategy
 
-    // -------------------- 分配策略枚举 --------------------
+    // -------------------- 分配策略 --------------------
     ENUM DispatchStrategy:
         kModuloHash       // 按routing_key取模 (默认,适合均匀分布)
         kConsistentHash   // 一致性哈希 (适合动态增减Worker)
         kRoundRobin       // 轮询
-        kLeastSessions    // 最少会话数
+        kLeastSessions    // 最少会话优先
+
+    // -------------------- 内部Worker结构 --------------------
+    STRUCT Worker:
+        thread: std::thread
+        event_loop: EventLoop
+        session_count: std::atomic<size_t>   // 当前绑定会话数 (kLeastSessions用)
 
     // -------------------- 构造 --------------------
     CONSTRUCTOR WorkerPool(
-            num_workers: size_t = 0,                     // 0=CPU核心数
+            num_workers: size_t = 0,
             strategy: DispatchStrategy = kModuloHash
     ):
-        worker_count = (num_workers > 0) ? num_workers
-                                         : std::thread::hardware_concurrency()
+        worker_count = (num_workers > 0)
+                       ? num_workers
+                       : std::thread::hardware_concurrency()
         strategy_ = strategy
 
         FOR i IN RANGE(0, worker_count):
-            workers_.EmplaceBack([this, i](WorkerContext ctx):
-                ctx.event_loop.Run()   // 每个Worker在自己的EventLoop中阻塞运行
+            worker = Worker{}
+            workers_.Push(std::move(worker))
+            // 启动线程: EventLoop::Run() 在各自线程阻塞
+            workers_[i].thread = std::thread([&workers = workers_, i]():
+                workers[i].event_loop.Run()
             )
 
-    // -------------------- 会话分配 --------------------
+    // -------------------- 任务调度 --------------------
 
-    // 根据策略为Session分配Worker并投递任务
+    // 根据routing_key选择目标Worker并投递任务
     FUNCTION Dispatch(
             routing_key: uint64_t,
             task: std::move_only_function<void()>
@@ -333,35 +372,36 @@ CLASS WorkerPool:
 
     // -------------------- 生命周期 --------------------
     FUNCTION Shutdown() -> void:
+        // 先通知所有Worker停止EventLoop
         FOR EACH worker IN workers_:
             worker.event_loop.Stop()
+        // 再等待所有线程结束
         FOR EACH worker IN workers_:
-            worker.thread.join()
+            IF worker.thread.joinable():
+                worker.thread.join()
 ```
 
 ---
 
-## 4. TaskQueue — 任务队列 (可替换实现)
+## 4. TaskQueue — 任务队列
 
 ```
 // ============================================================
 // 类名: TaskQueue
-// 描述: 线程安全FIFO任务队列
-//       默认实现: std::mutex + std::condition_variable + std::queue
-//       可替换为: 无锁队列 (MPSC)、优先级队列、有界队列
+// 描述: 线程安全FIFO任务队列 (多生产者-单消费者)
+//       默认: std::mutex + std::condition_variable + std::queue
+//       可替换: 无锁MPSC队列 / 优先级队列 / 有界队列 (背压)
 // ============================================================
 CLASS TaskQueue:
     PRIVATE MEMBER queue_: std::queue<std::move_only_function<void()>>
     PRIVATE MEMBER mutex_: std::mutex
     PRIVATE MEMBER cv_: std::condition_variable
 
-    // 添加任务 (线程安全, 多生产者)
     FUNCTION Push(task: std::move_only_function<void()>) -> void:
         LOCK(mutex_):
             queue_.push(std::move(task))
-        cv_.notify_one()   // 通知等待的消费者
+        cv_.notify_one()
 
-    // 阻塞等待并取出任务 (单消费者)
     FUNCTION Pop() -> std::move_only_function<void()>:
         LOCK(mutex_):
             cv_.wait(lock, [this](){ RETURN !queue_.empty() })
@@ -369,7 +409,6 @@ CLASS TaskQueue:
             queue_.pop()
             RETURN task
 
-    // 非阻塞尝试取出任务
     FUNCTION TryPop() -> std::optional<std::move_only_function<void()>>:
         LOCK(mutex_):
             IF queue_.empty():
@@ -378,15 +417,14 @@ CLASS TaskQueue:
             queue_.pop()
             RETURN task
 
-    // 批量消费: 一次性取出所有任务并执行 (避免频繁加锁)
+    // 批量消费: 交换到本地队列后锁外执行,减少锁竞争
     FUNCTION ExecuteAll() -> void:
-        // 先交换到一个本地队列,在锁外执行 → 减少锁竞争
-        local_queue = std::queue<std::move_only_function<void()>>{}
+        local = std::queue<std::move_only_function<void()>>{}
         LOCK(mutex_):
-            std::swap(local_queue, queue_)
-        WHILE !local_queue.empty():
-            local_queue.front()()
-            local_queue.pop()
+            std::swap(local, queue_)
+        WHILE !local.empty():
+            local.front()()
+            local.pop()
 ```
 
 ---
@@ -396,8 +434,8 @@ CLASS TaskQueue:
 ```
 // ============================================================
 // 类名: TimerQueue
-// 描述: 基于小顶堆的定时器管理器
-//       也可替换为时间轮 (适合大量短周期定时器) 等更高效结构
+// 描述: 基于小顶堆的定时器管理器 (可替换为分层时间轮)
+//       所有操作线程安全,支持延迟删除
 // ============================================================
 CLASS TimerQueue:
     STRUCT TimerEntry:
@@ -405,17 +443,15 @@ CLASS TimerQueue:
         expire_time: uint64_t                          // 绝对到期时间(ms)
         interval_ms: uint32_t                          // 重复间隔 (0=一次性)
         callback: std::move_only_function<void()>
-        // 堆排序: 按expire_time升序
         OPERATOR >(other: TimerEntry) -> bool:
-            RETURN expire_time > other.expire_time
+            RETURN expire_time > other.expire_time     // 小顶堆: 早到期优先
 
     PRIVATE MEMBER heap_: std::priority_queue<
         TimerEntry, std::vector<TimerEntry>, std::greater<TimerEntry>>
-    PRIVATE MEMBER canceled_: std::unordered_set<TimerHandle> // 取消集
+    PRIVATE MEMBER canceled_: std::unordered_set<TimerHandle>
     PRIVATE MEMBER next_id_: TimerHandle = 1
     PRIVATE MEMBER mutex_: std::mutex
 
-    // 添加定时器,返回句柄
     FUNCTION Add(
             delay_or_interval_ms: uint32_t,
             callback: std::move_only_function<void()>,
@@ -431,25 +467,25 @@ CLASS TimerQueue:
             })
             RETURN id
 
-    // 取消定时器 (延迟删除标记)
     FUNCTION Cancel(id: TimerHandle) -> void:
         LOCK(mutex_):
             canceled_.insert(id)
 
-    // 计算最近超时剩余时间 (供EventLoop确定Wait超时)
+    // 计算距最近定时器到期的剩余时间 (供EventLoop确定Wait超时)
     FUNCTION GetNextTimeout() -> std::optional<uint32_t>:
         LOCK(mutex_):
-            // 清理堆顶已取消条目
+            // 惰性清理堆顶已取消条目
             WHILE !heap_.empty() AND canceled_.contains(heap_.top().id):
                 canceled_.erase(heap_.top().id)
                 heap_.pop()
             IF heap_.empty():
-                RETURN std::nullopt        // 无定时器 → kInfinite
+                RETURN std::nullopt             // 无定时器 → EventLoop可无限等待
             now = Clock::NowMs()
             remaining = heap_.top().expire_time - now
             RETURN MAX(0, remaining)
 
-    // 执行所有已到期的定时器
+    // 执行所有已到期的定时器回调
+    // 注意: 回调在锁内执行; 如回调可能耗时,应改为投递到TaskQueue
     FUNCTION FireExpired(now: uint64_t) -> void:
         LOCK(mutex_):
             WHILE !heap_.empty() AND heap_.top().expire_time <= now:
@@ -458,10 +494,8 @@ CLASS TimerQueue:
                 IF canceled_.contains(entry.id):
                     canceled_.erase(entry.id)
                     CONTINUE
-                // 在锁内执行回调 (如回调耗时,可改为投递到任务队列)
-                entry.callback()
-                // 重复定时器重新入堆
-                IF entry.interval_ms > 0:
+                entry.callback()            // 执行回调
+                IF entry.interval_ms > 0:   // 重复定时器: 更新到期时间后重新入堆
                     entry.expire_time = now + entry.interval_ms
                     heap_.push(std::move(entry))
 ```
@@ -473,17 +507,13 @@ CLASS TimerQueue:
 ```
 // ============================================================
 // 接口: IEventHandler
-// 描述: IO事件回调接口,由需要使用EventLoop的类实现
+// 描述: IO事件回调接口,由需要监听Socket事件的类实现
 // ============================================================
 INTERFACE IEventHandler:
-    // 描述符可读时回调 (如Socket有数据到达)
-    VIRTUAL FUNCTION OnReadable() -> void = 0
-
-    // 描述符可写时回调 (如Socket发送缓冲区由满恢复)
-    VIRTUAL FUNCTION OnWritable() -> void { /* 默认空实现 */ }
-
-    // 描述符发生错误时回调
-    VIRTUAL FUNCTION OnError(error_code: int) -> void { /* 默认空实现 */ }
+    VIRTUAL FUNCTION OnReadable() -> void = 0           // 描述符可读
+    VIRTUAL FUNCTION OnWritable() -> void { /* 默认空 */ }  // 描述符可写
+    VIRTUAL FUNCTION OnError(error_code: int) -> void { /* 默认空 */ }  // 异常
+    VIRTUAL ~IEventHandler() = default
 ```
 
 ---
@@ -493,50 +523,39 @@ INTERFACE IEventHandler:
 ```
 // ============================================================
 // 类名: Message
-// 描述: 封装从传输层完整接收的用户数据
-//       支持零拷贝访问 (string_view / span) 和移动语义
+// 描述: 封装从传输层完整接收的用户数据消息
+//       支持零拷贝视图 (span / string_view) 和所有权转移
 // ============================================================
 CLASS Message:
-    // 数据可来自多种底层 (便于后续扩展)
-    USING DataBuffer = std::variant<
-        std::vector<uint8_t>,           // 自有数据 (默认)
-        std::shared_ptr<const uint8_t[]> // 共享数据 (零拷贝)
-    >
+    PRIVATE MEMBER data_: std::vector<uint8_t>             // 消息体
+    PUBLIC MEMBER session_id: uint32_t                     // 来源会话ID
+    PUBLIC MEMBER receive_time_ms: uint64_t                // 接收时间戳
 
-    PRIVATE MEMBER data_: DataBuffer
-    PRIVATE MEMBER data_view_: std::span<const uint8_t>  // 统一视图
-    PUBLIC MEMBER session_id: uint32_t                    // 来源会话ID
-    PUBLIC MEMBER receive_time_ms: uint64_t               // 接收时间戳
-
-    // 从原始数据构造 (拷贝模式)
     CONSTRUCTOR Message(
-            buf: const uint8_t*,       // [in] 数据指针
-            len: size_t,               // [in] 数据长度
-            sid: uint32_t              // [in] 会话ID
+            buf: const uint8_t*,     // [in] 数据指针
+            len: size_t,             // [in] 数据长度
+            sid: uint32_t            // [in] 会话ID
     ):
-        data_ = std::vector<uint8_t>(buf, buf + len)
-        data_view_ = std::span<const uint8_t>(
-            std::get<std::vector<uint8_t>>(data_))
-        session_id = sid
-        receive_time_ms = Clock::NowMs()
+        data_(buf, buf + len),           // 拷贝数据
+        session_id(sid),
+        receive_time_ms(Clock::NowMs())
+    {}
 
-    // 访问接口
+    // 只读访问 (零拷贝)
     FUNCTION Data() -> const uint8_t*:
-        RETURN data_view_.data()
+        RETURN data_.data()
 
     FUNCTION Size() -> size_t:
-        RETURN data_view_.size()
+        RETURN data_.size()
 
     FUNCTION AsSpan() -> std::span<const uint8_t>:
-        RETURN data_view_
+        RETURN std::span<const uint8_t>(data_.data(), data_.size())
 
     FUNCTION AsStringView() -> std::string_view:
         RETURN std::string_view(
-            reinterpret_cast<const char*>(data_view_.data()),
-            data_view_.size()
-        )
+            reinterpret_cast<const char*>(data_.data()), data_.size())
 
-    // 移动数据所有权 (用于跨线程传递,避免拷贝)
-    FUNCTION TakeData() -> DataBuffer:
+    // 移动取出数据所有权 (跨线程传递,避免拷贝)
+    FUNCTION TakeBytes() -> std::vector<uint8_t>:
         RETURN std::move(data_)
 ```

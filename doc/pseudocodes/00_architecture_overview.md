@@ -1,8 +1,8 @@
-# 架构总览 — 通用可配置KCP网络库
+# 架构总览 — 通用可配置网络库
 
 ## 1. 设计目标
 
-构建一个 **易用、高性能、跨平台、支持CS与P2P架构** 的网络库，以KCP协议为核心可替换传输层，提供低延迟、高可靠的传输能力，同时通过参数化配置适配从实时游戏到IoT数据上报等多种场景。
+构建一个 **易用、高性能、跨平台、支持CS与P2P架构** 的网络库，以可替换传输协议为核心，提供低延迟、高可靠的传输能力，同时通过分层参数化配置适配从实时游戏到IoT数据上报等多种场景。
 
 ## 2. 分层架构 (可替换层次设计)
 
@@ -17,19 +17,19 @@
 │   ConnectionPool (连接池, 支持多路复用)                          │
 ├──────────────────────────────────────────────────────────────┤
 │             Transport Protocol Layer (传输协议层)               │
-│   Session (协议会话抽象, 可替换为KCP/TCP/QUIC等)                 │
+│   Session (协议会话抽象, 可替换实现)                             │
 │     - 生命周期管理 (Start / Close / GracefulShutdown)          │
 │     - 数据收发 (Send / FeedInput / TryRecv)                    │
 │     - 状态驱动 (Update)                                       │
-│     - 回调管理 (OutputCallback / MessageCallback / ErrorCallback)│
-│     - 统计收集 (Statistics)                                    │
+│     - 回调管理 (OnMessage / OnError / OnStateChange)           │
+│     - 统计收集 (GetStats)                                      │
 ├──────────────────────────────────────────────────────────────┤
 │              Platform Layer (平台抽象层)                         │
 │   EventLoop (epoll / IOCP / kqueue 统一抽象)                   │
-│   ThreadScheduler (线程调度器, 支持多种分配策略)                 │
-│   TimerService (定时器服务)                                    │
+│   WorkerPool (线程调度器, 支持多种分配策略)                      │
+│   TimerQueue (定时器服务, 小顶堆/时间轮可替换)                    │
 │   DatagramSocket (数据报Socket抽象, 支持UDP/UDPLite/RAW)        │
-│   TaskQueue (无锁/有锁可配置任务队列)                            │
+│   TaskQueue (有锁/无锁可配置任务队列)                            │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -48,16 +48,16 @@ FUNCTION LibraryInitialize(config: LibraryConfig):
     // 全局配置: 日志级别、内存分配器、平台选择策略等
     // 所有层级的默认参数均可在此统一指定,逐层覆盖
     LibraryConfig DEFAULT:
-        .io_backend           = AUTO_DETECT         // 自动选择最优IO模型
-        .default_mtu           = 1400               // 默认MTU,可按链路调整
-        .default_send_window   = 128                // 默认发送窗口(包数)
-        .default_recv_window   = 128                // 默认接收窗口(包数)
-        .default_update_tick_ms = 10                // 默认驱动时钟周期
-        .default_timeout_ms    = 30000              // 默认超时阈值
-        .socket_rcvbuf_bytes   = 256 * 1024         // Socket接收缓冲
-        .socket_sndbuf_bytes   = 256 * 1024         // Socket发送缓冲
-        .max_worker_threads    = CPU_CORE_COUNT      // 最大工作线程数
-        .enable_metrics        = true               // 是否启用指标收集
+        .io_backend            = AUTO_DETECT         // 自动选择最优IO模型
+        .default_mtu            = 1400               // 默认MTU,可按链路调整
+        .default_send_window    = 128                // 默认发送窗口(包数)
+        .default_recv_window    = 128                // 默认接收窗口(包数)
+        .default_update_tick_ms = 10                 // 默认驱动时钟周期
+        .default_timeout_ms     = 30000              // 默认超时阈值
+        .socket_rcvbuf_bytes    = 256 * 1024         // Socket接收缓冲
+        .socket_sndbuf_bytes    = 256 * 1024         // Socket发送缓冲
+        .max_worker_threads     = HARDWARE_CONCURRENCY  // 最大工作线程数
+        .enable_metrics         = true               // 是否启用指标收集
 
 // --------------------------------------------------
 // 3.2 服务端启动流程 (泛化)
@@ -77,7 +77,10 @@ FUNCTION ServerStart(config: ServerConfig):
             ApplicationLogic.ProcessMessage(msg)
         )
         session.OnError(FUNCTION(error):
-            ApplicationLogic.HandleError(session, error)
+            ApplicationLogic.HandleSessionError(session, error)
+        )
+        session.OnStateChange(FUNCTION(old_state, new_state):
+            ApplicationLogic.HandleStateChange(session, old_state, new_state)
         )
     )
 
@@ -102,16 +105,15 @@ FUNCTION ClientConnect(config: ClientConfig):
         .backoff_factor   = 2.0
     })
 
-    // Connect返回的是一个异步句柄,可在回调中获得Session
+    // Connect是异步的: 成功/失败通过回调通知
+    // 在收到服务器首个响应ACK之前,状态保持为 kConnecting
     client.Connect(config.remote_address,
-        // 成功回调
-        FUNCTION(session):
+        FUNCTION(session):    // 成功: 服务器已响应,会话已建立
             session.OnMessage(FUNCTION(msg):
                 ApplicationLogic.ProcessMessage(msg)
             )
         ,
-        // 失败回调
-        FUNCTION(error):
+        FUNCTION(error):      // 失败: 超时/拒绝/DNS失败等
             ApplicationLogic.HandleConnectFailed(error)
     )
 
@@ -122,58 +124,61 @@ FUNCTION ClientConnect(config: ClientConfig):
 // --------------------------------------------------
 FUNCTION DataSendFlow(session, user_data):
     // 步骤1: 应用层调用 Send(user_data)
-    // 步骤2: Session检查状态和流控窗口
-    //    IF send_window_full: 返回 kPending / 加入发送等待队列
-    // 步骤3: Session调用协议层 send(user_data)
-    // 步骤4: 协议层根据MTU分段为传输单元 (segment/frame)
-    // 步骤5: 分段加入发送队列,等待下次Update时发送
-    // 步骤6: Update()驱动时:
-    //    a. 检查发送窗口 → 将窗口内分段通过OutputCallback输出
-    //    b. OutputCallback → Socket.SendTo(network)
+    // 步骤2: Session检查状态: state_ != kConnected → 返回 kBlocked
+    // 步骤3: Session委托协议引擎 send(user_data)
+    // 步骤4: 协议引擎根据MTU将用户数据分段为传输单元 (segment)
+    //   每个传输单元 = [协议头(变长)] + [用户数据分片]
+    // 步骤5: 分段加入发送队列
+    // 步骤6: 下次Update()时:
+    //    a. 检查发送窗口余量 → 窗口内分段通过OutputCallback输出
+    //    b. OutputCallback → Socket.SendTo → 网络
+    //    c. 记录各分段的序列号和发送时间 (用于RTO/重传判定)
+    // 步骤7: Update后若发送成功,统计计数器更新在引擎回调中进行
+    //    (bytes_sent, messages_sent 在引擎确认交付后递增)
 
     result = session.Send(user_data)
     IF result == SendResult::kQueued:
-        // 数据已加入发送缓冲,等待协议层异步发送
-        // 可通过 session.OnSendComplete() 注册发送完成回调
-        pass
+        // 数据已加入发送缓冲,等待协议引擎异步发送
+        // 可通过 session.OnSendComplete() 注册发送完成回调 (可选扩展)
     ELSE IF result == SendResult::kBlocked:
-        // 发送窗口满或缓冲区满,需等待
-        // 应用层可选择: 丢弃 / 阻塞等待 / 加入应用层队列
+        // 状态非kConnected或发送窗口满
+        // 应用层可选: 丢弃 / 阻塞等待 / 加入应用层重试队列
 
 // --------------------------------------------------
 // 3.5 数据接收流程 (网络→应用层) — 完整管线
 // --------------------------------------------------
 FUNCTION DataReceiveFlow(session):
     // 步骤1: EventLoop监听到Socket可读事件
-    // 步骤2: Socket读取原始数据报
-    // 步骤3: 根据数据报头部的conv/cmd等字段路由到对应Session
-    // 步骤4: Session将数据报输入协议层进行解析
-    // 步骤5: 协议层内部处理: 头部解析→ACK处理→乱序缓存→按序重组
-    // 步骤6: 如果有完整用户消息组装完毕:
-    //    - 触发MessageCallback → 用户回调
-    //    - 更新统计计数器 (bytes_recv, packets_recv, messages_recv)
-    // 步骤7: 如果协议层有ACK需要发送:
-    //    - 在下次Update时通过OutputCallback输出ACK包
+    // 步骤2: Socket读取原始数据报 → 得到发送方地址和载荷
+    // 步骤3: 端点(Object)根据数据报头的routing_key路由到对应Session
+    // 步骤4: Session.FeedInput() → 协议引擎.Input()
+    //   协议引擎内部: 头部解析→ACK信息处理→按序插入接收缓冲→乱序重组
+    // 步骤5: FeedInput末尾自动调用 TryRecv()
+    //   如果协议引擎有完整用户消息就绪:
+    //     a. 组装为Message对象
+    //     b. 触发 OnMessage 回调
+    //     c. 更新统计 (bytes_recv, messages_recv)
 
-    // 数据流路径汇总:
-    // Socket.Read() → Session.FeedInput() → Protocol.Input()
-    //   → [内部重组] → Session.TryRecv() → MessageCallback
+    // 数据流单行汇总:
+    // Socket.Read() → Session.FeedInput() → Engine.Input()
+    //   → [内部重组] → Session.TryRecv() → OnMessage(Message)
 
 // --------------------------------------------------
 // 3.6 定时驱动流程 (协议状态机推进)
 // --------------------------------------------------
 FUNCTION TimerDriveFlow(event_loop, sessions):
-    // 定时器以可配置的时钟周期 (默认与协议内部interval对齐) 触发
-    // 每个时钟周期内,遍历所有活跃Session:
-    //   session.Update(current_time)
-    //   协议层Update内部处理:
-    //     a. 检查发送队列中超时的分段 → 标记重传
-    //     b. 检查快速重传条件 (重复ACK计数 >= 阈值)
-    //     c. 将待发送分段(含重传)通过OutputCallback输出
-    //     d. 更新RTO/RTT估算
-    //     e. 更新拥塞/流控状态
+    // 定时器以配置的时钟周期 (默认与协议内部interval对齐) 周期性触发
+    // 每个时钟周期遍历所有活跃Session,调用:
+    //   session.Update(now_ms)
+    //
+    // 协议引擎Update内部处理 (按顺序):
+    //   a. 遍历发送队列,检查各分段的RTO超时 → 标记重传
+    //   b. 检查快速重传条件 (重复ACK计数 >= fast_resend_threshold)
+    //   c. 将待发送分段(新数据+重传+ACK)通过OutputCallback输出
+    //   d. 更新RTO/RTT估算值
+    //   e. 更新拥塞/流控状态 (如启用)
 
-    timer_id = event_loop.AddPeriodicTimer(
+    event_loop.AddPeriodicTimer(
         config.update_tick_ms,
         FUNCTION():
             now = Clock::NowMs()
@@ -185,54 +190,47 @@ FUNCTION TimerDriveFlow(event_loop, sessions):
 // 3.7 超时与连接健康管理
 // --------------------------------------------------
 FUNCTION ConnectionHealthCheck(server, config):
-    // 周期性扫描所有会话,评估连接健康度:
-    //   - Ice (空闲时间) = now - last_recv_time
-    //   - 分级判定:
-    //       Ice < warning_threshold   → HEALTHY  (正常)
-    //       Ice >= warning_threshold  → IDLE     (空闲,可发送探活)
-    //       Ice >= timeout_threshold  → STALE    (过期,触发清理)
-    //
-    // 可配置的清理动作:
-    //   eviction_policy: { IMMEDIATE_CLOSE | GRACEFUL_SHUTDOWN | NOTIFY_ONLY }
-    
-    timer_id = event_loop.AddPeriodicTimer(
+    // 周期性扫描所有会话,进行三级健康评估:
+    //   空闲时长 = now - session.GetLastRecvTime()
+    //   判定逻辑:
+    //     空闲时长 < idle_timeout_ms        → kHealthy (正常通信)
+    //     idle_timeout_ms <= 空闲时长 < stale_timeout_ms → kIdle (空闲,发送探活)
+    //     空闲时长 >= stale_timeout_ms      → kStale  (过期,触发驱逐)
+
+    event_loop.AddPeriodicTimer(
         config.health_check_interval_ms,
         FUNCTION():
             now = Clock::NowMs()
+            stale_list = []
             FOR EACH (id, session) IN server.sessions_:
-                health = session.EvaluateHealth(now)
-                IF health == CONNECTION_HEALTH::kStale:
-                    server.HandleStaleSession(session, config.eviction_policy)
-                ELSE IF health == CONNECTION_HEALTH::kIdle:
+                health = session.EvaluateHealth(now,
+                    config.idle_timeout_ms, config.stale_timeout_ms)
+                IF health == ConnectionHealth::kStale:
+                    stale_list.push_back(id)
+                ELSE IF health == ConnectionHealth::kIdle:
                     server.HandleIdleSession(session, config.idle_policy)
+
+            // 批量清理过期会话 (避免遍历中修改Map)
+            FOR EACH conv IN stale_list:
+                server.EvictSession(conv, EvictReason::kTimedOut)
 
 // --------------------------------------------------
 // 3.8 协议配置模式
 // --------------------------------------------------
 FUNCTION ConfigureProtocol(session, profile: ProtocolProfile):
-    // 协议参数不再硬编码,而是通过预设Profile或自定义参数配置
-    // 预定义Profile:
-    ProtocolProfile FAST_MODE = {
-        .nodelay       = 1,        // 快速模式
-        .interval_ms   = 10,       // 内部时钟周期
-        .fast_resend   = 2,        // 快速重传触发阈值
-        .flow_control  = false     // 关闭流控
-    }
-    ProtocolProfile RELIABLE_MODE = {
-        .nodelay       = 0,        // 普通模式
-        .interval_ms   = 100,      // 大时钟周期,降低CPU开销
-        .fast_resend   = 0,        // 禁用快速重传
-        .flow_control  = true      // 启用流控,公平共享带宽
-    }
-    ProtocolProfile CUSTOM_MODE = {
-        // 用户自定义,逐参数调整
-        .nodelay       = user_config.nodelay,
-        .interval_ms   = user_config.interval_ms,
-        .fast_resend   = user_config.fast_resend,
-        .flow_control  = user_config.enable_flow_control
-    }
+    // 通过预设Profile或逐参数自定义来配置协议行为
+    // 推荐使用FromProfile工厂方法获取预设 → 再按需覆盖个别字段
 
-    session.ApplyProfile(profile)
+    // 预定义Profile示例:
+    //   kFastMode:     nodelay=1, interval=10, resend=2, fc=false
+    //   kReliableMode: nodelay=0, interval=100, resend=0, fc=true
+    //   kBalancedMode: nodelay=1, interval=20, resend=2, fc=true
+    //   kCustom:       用户直接设置Config各字段
+
+    config = Session::Config::FromProfile(profile)
+    // 在预设基础上微调 (可选):
+    config.mtu_bytes = 1200  // 覆盖MTU以适配特定链路
+    session.ApplyConfig(config)
 ```
 
 ## 4. 核心模块依赖关系与扩展点
@@ -241,7 +239,7 @@ FUNCTION ConfigureProtocol(session, profile: ProtocolProfile):
                     ┌──────────────────┐
                     │   Application     │
                     └────────┬─────────┘
-                             │ 依赖接口 (不依赖具体实现)
+                             │ 仅依赖公开接口
               ┌──────────────┼──────────────┐
               ▼              ▼              ▼
        ┌────────────┐ ┌────────────┐ ┌──────────────┐
@@ -249,12 +247,12 @@ FUNCTION ConfigureProtocol(session, profile: ProtocolProfile):
        │ (端点抽象)  │ │ (端点抽象)  │ │ (通用数据类型) │
        └─────┬──────┘ └─────┬──────┘ └──────────────┘
              │               │
-             │ 管理           │ 持有
+             │ 创建/管理      │ 创建/持有
              ▼               ▼
        ┌──────────────────────────────────┐
        │       Session (协议会话抽象)        │
        │    (可选 enable_shared_from_this)   │
-       │    扩展点: 可替换底层协议实现         │
+       │    扩展点: 可替换底层协议引擎实现      │
        └────────────────┬─────────────────┘
                         │ 委托
        ┌────────────────┼─────────────────┐
@@ -262,101 +260,95 @@ FUNCTION ConfigureProtocol(session, profile: ProtocolProfile):
    ┌──────────┐  ┌──────────────┐  ┌──────────────┐
    │ Protocol │  │ DatagramSocket│  │  TaskQueue   │
    │ Engine   │  │ (可替换传输层) │  │ (线程安全队列) │
-   │(KCP/自研)│  └──────────────┘  └──────────────┘
-   └──────────┘
+   └──────────┘  └──────────────┘  └──────────────┘
 
    关键扩展点:
-   1. Protocol Engine  — 可替换为任意可靠传输协议
-   2. DatagramSocket   — 可替换为UDPLite、RAW Socket、甚至模拟层
-   3. TaskQueue        — 可替换为无锁队列、优先级队列等
-   4. TimerService     — 可替换为高精度定时器或时间轮
+   1. Protocol Engine  — 实现统一接口即可替换为任意可靠传输协议
+   2. DatagramSocket   — 适配UDPLite/RAW Socket/模拟测试层
+   3. TaskQueue        — 可替换为无锁MPSC队列/优先级队列/有界队列
+   4. TimerService     — 可替换为高精度定时器/分层时间轮
+   5. IOBackend        — 可替换为epoll/IOCP/kqueue/poll
 ```
 
 ## 5. 线程模型 (多策略可配置)
 
 ```
 // ============================================================
-// 5.1 单线程EventLoop模式 (推荐用于简单场景)
+// 5.1 单线程EventLoop模式 (推荐用于连接数 < 1000 的场景)
 // ============================================================
 // 一个线程运行一个EventLoop,管理所有Session
-// 优点: 零锁开销,逻辑简单; 适用: 连接数 < 1000
+// 优点: 零锁开销,逻辑简单,调试方便; 缺点: 不能利用多核
 FUNCTION SingleThreadModel():
     event_loop = EventLoop::Create()
-    // 所有IO事件、定时器、Session操作在同一线程执行
-    event_loop.Run()  // 单线程阻塞运行
+    event_loop.Run()  // 单线程阻塞运行,所有操作串行化
 
 // ============================================================
-// 5.2 多线程Sticky模式 (推荐用于高并发)
+// 5.2 多线程Worker模式 (推荐用于高并发,连接数 > 1000)
 // ============================================================
-// 每个Worker线程运行独立EventLoop,Session按键哈希粘滞到固定线程
-// 优点: 无需锁,水平扩展; 适用: 连接数 > 1000
-FUNCTION MultiThreadStickyModel(sessions, num_workers):
+// N个Worker线程各运行独立EventLoop,Session按键哈希粘滞到固定Worker
+// 同一Session的所有操作在同一Worker线程执行 → 无需锁
+// 跨Worker操作通过目标Worker的TaskQueue投递闭包
+FUNCTION MultiThreadWorkerModel(num_workers):
     workers = ARRAY OF WorkerThread[num_workers]
     FOR EACH worker IN workers:
-        worker.Start()  // 每个Worker在自己的EventLoop中运行
+        worker.Start()
 
-    // Session→Worker 映射策略 (可替换)
-    FUNCTION AssignSession(session, routing_key):
-        index = HASH(routing_key) MOD num_workers
-        // 备选策略: 轮询(RoundRobin)、最少连接(LeastConnection)、
-        //          一致性哈希(ConsistentHash)、指定亲和性(Affinity)
-        workers[index].BindSession(session)
-
-    // 跨线程操作: 通过目标Worker的TaskQueue投递闭包
-    FUNCTION Dispatch(session, task):
-        worker = session.GetBoundWorker()
-        worker.PostTask(task)  // 线程安全的消息传递
+    // Session→Worker 分配策略 (可插拔):
+    DispatchStrategy OPTIONS:
+        kModuloHash      // hash(routing_key) % N (默认,适合均匀分布)
+        kConsistentHash   // 一致性哈希 (适合动态增减Worker)
+        kRoundRobin       // 轮询
+        kLeastSessions    // 最少会话优先
 
 // ============================================================
-// 5.3 互斥锁模式 (兼容模式,不推荐)
+// 5.3 互斥锁模式 (仅用于遗留系统兼容或开发调试)
 // ============================================================
-// 所有Session共享一个EventLoop,用mutex保护共享状态
-// 优点: 实现简单; 缺点: 锁竞争限制吞吐,空转消耗CPU
-// 仅用于遗留系统集成或开发调试阶段
-FUNCTION MutexBasedModel():
-    // 对Session的所有公共操作内部加锁
-    // 使用 std::shared_mutex 实现读多写少优化
-    // 注意: 需防范死锁和优先级反转
+// 所有Session共享一个EventLoop和一把大锁
+// 优点: 实现简单; 缺点: 锁竞争限制吞吐,无法利用多核
+// 不建议在生产环境使用
 ```
 
 ## 6. 配置体系总览
 
 ```
 // ============================================================
-// 分层配置结构,支持逐层覆盖
+// 分层配置结构,支持逐层覆盖: Library → Endpoint → Session
 // ============================================================
 
 STRUCT LibraryConfig:        // 库级全局配置
-    .io_backend               // IO后端选择: kAutoDetect / kEpoll / kIocp / kKqueue
-    .allocator                // 内存分配器: 默认使用std::allocator,可替换为池分配器
-    .log_sink                 // 日志输出: 控制台/文件/自定义回调
-    .metrics_sink             // 指标输出: 无/Prometheus/自定义回调
+    .io_backend               // kAutoDetect / kEpoll / kIocp / kKqueue / kPoll
+    .allocator                // 可替换内存分配器
+    .log_sink                 // 日志输出目标
+    .metrics_sink             // 指标输出目标 (Prometheus/自定义)
 
 STRUCT ServerConfig:          // 服务端配置
-    .listen_address           // 监听地址
-    .session_config           // 会话级协议配置 (见下)
-    .eviction_policy          // 驱逐策略: kImmediate / kGraceful / kNotifyOnly
-    .health_check_interval_ms // 健康检测间隔
-    .idle_timeout_ms          // 空闲超时
-    .max_sessions             // 最大会话数 (0=不限制)
+    .listen_address           // DatagramSocket::Address  监听地址
+    .session_config           // Session::Config          新会话默认配置
+    .eviction_policy          // EvictionPolicy           驱逐策略
+    .idle_policy              // IdlePolicy               空闲处理策略
+    .health_check_interval_ms // uint32_t                 健康检测周期
+    .idle_timeout_ms          // uint32_t                 空闲判定阈值
+    .stale_timeout_ms         // uint32_t                 过期判定阈值
+    .max_sessions             // size_t                   最大会话数 (0=不限制)
 
 STRUCT ClientConfig:          // 客户端配置
-    .remote_address           // 远端地址
-    .session_config           // 会话级协议配置
-    .reconnect_strategy       // 重连策略: 固定间隔/指数退避/自定义
-    .connect_timeout_ms       // 连接超时
-    .local_bind_address       // 本地绑定地址 (可选,默认OS分配)
+    .remote_address           // DatagramSocket::Address  目标地址
+    .session_config           // Session::Config          会话配置
+    .reconnect                // std::optional<ReconnectStrategy>  重连策略
+    .connect_timeout_ms       // uint32_t                 连接超时
+    .local_bind_address       // DatagramSocket::Address  本地绑定地址
 
-STRUCT SessionConfig:         // 会话级协议配置
-    .protocol_profile         // 协议预设: kFastMode / kReliableMode / kCustom
-    .mtu_bytes                // MTU
-    .send_window_packets      // 发送窗口(包数)
-    .recv_window_packets      // 接收窗口(包数)
-    .update_tick_ms           // Update驱动周期
-    // 以下仅在 kCustom 模式下生效:
-    .nodelay_enabled          // 是否启用快速模式
-    .fast_resend_threshold    // 快速重传触发阈值
-    .flow_control_enabled     // 是否启用流控
-    .rx_buffer_initial_bytes  // 接收缓冲初始大小
-    .tx_buffer_initial_bytes  // 发送缓冲初始大小
+STRUCT Session::Config:       // 会话级协议配置
+    .profile                  // ProtocolProfile          预设选择
+    // --- 仅kCustom模式逐项生效,否则由FromProfile填充 ---
+    .nodelay                  // int                      快速模式开关
+    .update_interval_ms       // int                      内部时钟周期
+    .fast_resend_threshold    // int                      快速重传阈值
+    .flow_control_enabled     // bool                     流控开关
+    // --- 以下字段对所有Profile生效,可独立覆盖 ---
+    .mtu_bytes                // int                      最大传输单元
+    .send_window_packets      // int                      发送窗口(包数)
+    .recv_window_packets      // int                      接收窗口(包数)
+    .rx_buffer_init_bytes     // size_t                   接收缓冲初始大小
+    .tx_buffer_init_bytes     // size_t                   发送缓冲初始大小
 ```
