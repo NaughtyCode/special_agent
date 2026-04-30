@@ -96,6 +96,17 @@ class DocAgent(BaseAgent):
         self.tool_manager.register(SearchCodeTool())
         self.tool_manager.register(ListFilesTool())
         self.tool_manager.register(WebSearchTool())  # 用于查找外部参考
+
+    def __init__(self, config: Config | None = None,
+                 agent_config: AgentConfig | None = None) -> None:
+        # DocAgent 使用中等温度以平衡准确性和表达力
+        if agent_config is None:
+            agent_config = AgentConfig(
+                llm_temperature_override=0.6,
+                max_iterations=10
+            )
+        super().__init__(name=self.name, description=self.description,
+                        config=config, agent_config=agent_config)
 ```
 
 ### 3.3 SearchAgent — 搜索 Agent
@@ -130,6 +141,17 @@ class SearchAgent(BaseAgent):
         self.tool_manager.register(WebFetchTool())
         self.tool_manager.register(ReadFileTool())
         self.tool_manager.register(ListFilesTool())
+
+    def __init__(self, config: Config | None = None,
+                 agent_config: AgentConfig | None = None) -> None:
+        # SearchAgent 使用较低温度提高搜索精确度
+        if agent_config is None:
+            agent_config = AgentConfig(
+                llm_temperature_override=0.4,
+                max_iterations=8
+            )
+        super().__init__(name=self.name, description=self.description,
+                        config=config, agent_config=agent_config)
 ```
 
 ### 3.4 ShellAgent — Shell 操作 Agent
@@ -165,6 +187,17 @@ class ShellAgent(BaseAgent):
         self.tool_manager.register(ReadFileTool())
         self.tool_manager.register(WriteFileTool())
         self.tool_manager.register(ListFilesTool())
+
+    def __init__(self, config: Config | None = None,
+                 agent_config: AgentConfig | None = None) -> None:
+        # ShellAgent 使用最低温度确保命令的确定性和安全性
+        if agent_config is None:
+            agent_config = AgentConfig(
+                llm_temperature_override=0.2,
+                max_iterations=6
+            )
+        super().__init__(name=self.name, description=self.description,
+                        config=config, agent_config=agent_config)
 ```
 
 ## 4. 扩展指南 — 创建自定义 Agent

@@ -209,7 +209,7 @@ class LLMClient:
 |----------|------|--------|
 | `LLM_API_KEY` | API 密钥 (必需) | 无, 必须设置 |
 | `LLM_BASE_URL` | API 基础地址 | `https://api.deepseek.com` |
-| `LLM_MODEL` | 默认模型名称 | `deepseek-chat` |
+| `LLM_MODEL` | 默认模型名称 | `deepseek-v4-pro` |
 | `LLM_MAX_TOKENS` | 最大生成 Token 数 | `4096` |
 | `LLM_TEMPERATURE` | 采样温度 (0-2) | `0.7` |
 | `LLM_TIMEOUT` | 请求超时 (秒) | `60` |

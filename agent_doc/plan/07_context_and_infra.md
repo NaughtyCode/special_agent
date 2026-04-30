@@ -290,20 +290,23 @@ SpecialAgent/
 │   │   ├── 06_specialized_agents.md
 │   │   ├── 07_context_and_infra.md
 │   │   └── 08_implementation_roadmap.md
+│   ├── changelog/                     # 修改记录文档
 │   └── tasks.txt
 ├── agent/                             # Agent 框架源码 (待实现)
 │   ├── __init__.py
 │   ├── main.py
 │   ├── core/
 │   │   ├── __init__.py
+│   │   ├── models.py                  # 共享数据模型 (Message, ChatResponse, TokenUsage 等)
 │   │   ├── base_agent.py              # BaseAgent 基类 + AgentConfig + 状态机
 │   │   ├── react_engine.py            # ReAct 推理引擎 + 终止条件
 │   │   ├── react_parser.py            # ReAct 输出解析器 (文本/FC/回退)
 │   │   ├── tool_manager.py            # Tool 管理器
 │   │   ├── context_store.py           # 上下文存储 + 压缩策略
-│   │   ├── agent_registry.py          # Agent 注册中心
+│   │   ├── agent_registry.py          # Agent 注册中心 + AgentMeta + MatchResult
 │   │   ├── agent_pool.py              # Agent 实例池
-│   │   └── session_manager.py         # 会话管理器
+│   │   ├── session_manager.py         # 会话管理器
+│   │   └── plugin_loader.py           # Agent 插件加载器
 │   ├── llm/
 │   │   ├── __init__.py
 │   │   ├── llm_client.py              # LLMClient Facade
@@ -330,8 +333,8 @@ SpecialAgent/
 │   │   └── compress_strategy.py       # CompressStrategy 接口 + Sliding/Summarize/Hybrid
 │   ├── events/
 │   │   ├── __init__.py
-│   │   ├── event_bus.py               # EventBus
-│   │   └── events.py                  # 事件类定义
+│   │   ├── events.py                  # 事件类定义 (AgentLifecycleEvent, ToolCallEvent 等)
+│   │   └── event_bus.py               # EventBus
 │   └── infra/
 │       ├── __init__.py
 │       ├── config.py                  # Config (provider-agnostic, 兼容 DEEPSEEK_*)
@@ -345,7 +348,7 @@ SpecialAgent/
 │   └── test_integration.py
 ├── plugins/                           # Agent 插件目录 (用户自定义 Agent)
 │   └── example_agent.py
-├── changelog/                         # 修改记录
+├── changelog/                         # 修改记录 (历史)
 ├── requirements.txt
 └── README.md
 ```

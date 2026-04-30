@@ -177,7 +177,19 @@ class AgentRegistry:
         - 必须继承自 BaseAgent
         - name 属性必须非空且不冲突
         - description 属性必须非空
-        同时生成对应的 AgentTool 元数据以供导出。
+        同时提取 Agent 元数据缓存以供导出和 AgentTool 构造。
+        """
+
+    def get_agent_meta(self, agent_name: str) -> AgentMeta:
+        """
+        获取 Agent 的元数据 (不创建实例)。
+
+        返回 AgentMeta:
+            - name: str — Agent 名称
+            - description: str — Agent 功能描述
+            - tags: list[str] — 标签列表
+            - agent_cls: type[BaseAgent] — Agent 类引用
+        若未注册则抛出 AgentNotFoundError。
         """
 
     def register_from_module(self, module_path: str) -> int:
@@ -223,6 +235,23 @@ class AgentRegistry:
 
     def get_agent_tools_schema(self) -> list[dict]:
         """将所有注册 Agent 转换为 Function Calling Schema 格式。"""
+
+@dataclass
+class AgentMeta:
+    """Agent 元数据 — 由 AgentRegistry 缓存, 供 AgentTool 等消费"""
+    name: str                           # Agent 名称
+    description: str                    # Agent 功能描述
+    tags: list[str]                     # 标签列表
+    agent_cls: type[BaseAgent]          # Agent 类引用
+
+@dataclass
+class MatchResult:
+    """Tool/Agent 匹配结果"""
+    tool_name: str | None               # 匹配到的 Tool 名称 (Tool 匹配时)
+    agent_name: str | None              # 匹配到的 Agent 名称 (Agent 匹配时)
+    score: float                        # 匹配得分 (0-1)
+    strategy_used: str                  # 使用的匹配策略名称
+    candidates: list[str]               # 其他候选名称 (得分低于阈值的前 N 个)
 ```
 
 ## 5. AgentPool — Agent 实例池
@@ -239,11 +268,11 @@ class AgentPool:
     """
 
     def __init__(self, max_instances: int | None = None,
-                 idle_timeout: float = 300.0) -> None:
+                 idle_timeout: float | None = None) -> None:
         """
         初始化。
-        - max_instances: 最大并发实例数 (None = 无限制)
-        - idle_timeout: 实例空闲超时 (秒), 超时后回收
+        - max_instances: 最大并发实例数 (None = 无限制, 从 Config 读取)
+        - idle_timeout: 实例空闲超时, 超时后回收 (None = 使用 Config 默认值 300s)
         """
 
     def acquire(self, agent_name: str,

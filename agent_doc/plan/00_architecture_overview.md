@@ -153,47 +153,58 @@ SpecialAgent/
 ├── agent_doc/
 │   ├── issues/                    # 需求文档
 │   ├── plan/                      # 计划文档
+│   ├── changelog/                 # 修改记录文档
 │   └── tasks.txt                  # 任务入口
 ├── agent/                         # Agent 框架源码
 │   ├── __init__.py
+│   ├── main.py                    # 程序入口
 │   ├── core/
 │   │   ├── __init__.py
+│   │   ├── models.py              # 共享数据模型定义
 │   │   ├── base_agent.py          # BaseAgent 基类
 │   │   ├── react_engine.py        # ReAct 推理引擎
 │   │   ├── react_parser.py        # ReAct 输出解析器
 │   │   ├── tool_manager.py        # Tool 管理器
 │   │   ├── context_store.py       # 上下文存储
 │   │   ├── agent_registry.py      # Agent 注册中心
-│   │   └── agent_pool.py          # Agent 实例池 (复用)
+│   │   ├── agent_pool.py          # Agent 实例池 (复用)
+│   │   ├── session_manager.py     # 会话管理器
+│   │   └── plugin_loader.py       # 插件加载器
 │   ├── llm/
 │   │   ├── __init__.py
-│   │   ├── llm_client.py          # LLM 客户端 (门面)
+│   │   ├── llm_client.py          # LLM 客户端 (Facade)
 │   │   ├── llm_provider.py        # LLMProvider 接口定义
 │   │   └── openai_compat.py       # OpenAI-compatible Provider
 │   ├── agents/
 │   │   ├── __init__.py
-│   │   ├── root_agent.py          # RootAgent: 控制台输入处理
-│   │   ├── code_agent.py          # 代码特化 Agent
-│   │   └── doc_agent.py           # 文档特化 Agent
+│   │   ├── root_agent.py          # RootAgent
+│   │   ├── code_agent.py          # CodeAgent
+│   │   ├── doc_agent.py           # DocAgent
+│   │   ├── search_agent.py        # SearchAgent
+│   │   └── shell_agent.py         # ShellAgent
 │   ├── tools/
 │   │   ├── __init__.py
 │   │   ├── base_tool.py           # Tool 基类
 │   │   ├── file_tools.py          # 文件操作 Tool
 │   │   ├── shell_tools.py         # Shell 执行 Tool
-│   │   └── agent_tool.py          # Agent 作为 Tool 的适配器
+│   │   ├── search_tools.py        # 代码搜索 Tool
+│   │   ├── web_tools.py           # 网络搜索 Tool
+│   │   └── agent_tool.py          # Agent → Tool 适配器
 │   ├── strategies/
 │   │   ├── __init__.py
 │   │   ├── match_strategy.py      # Tool 匹配策略接口与实现
 │   │   └── compress_strategy.py   # 上下文压缩策略接口与实现
 │   ├── events/
 │   │   ├── __init__.py
+│   │   ├── events.py              # 事件类定义
 │   │   └── event_bus.py           # 事件总线
-│   ├── infra/
-│   │   ├── __init__.py
-│   │   ├── config.py              # 配置管理 (provider-agnostic)
-│   │   └── logger.py              # 日志模块
-│   └── main.py                    # 程序入口
-├── changelog/                     # 修改记录
+│   └── infra/
+│       ├── __init__.py
+│       ├── config.py              # 配置管理 (provider-agnostic)
+│       └── logger.py              # 日志模块
+├── tests/                         # 测试目录
+├── plugins/                       # Agent 插件目录
+├── changelog/                     # 修改记录 (历史)
 └── doc/                           # 参考文档 (历史)
 ```
 

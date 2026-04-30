@@ -64,15 +64,18 @@ class ReActEngine:
     def __init__(self, llm_client: LLMClient,
                  tool_manager: ToolManager,
                  agent_registry: AgentRegistry,
+                 context_store: ContextStore,
+                 event_bus: EventBus,
                  config: Config,
                  agent_config: AgentConfig | None = None,
                  match_strategy: MatchStrategy | None = None,
                  output_parser: OutputParser | None = None) -> None:
         """
         初始化引擎。
+        - 绑定 LLM 客户端、Tool 管理器、Agent 注册中心、上下文存储、事件总线
         - 合并 Config 和 AgentConfig 中的参数
-        - 若未提供 match_strategy, 使用默认 MatchStrategyChain(Exact, Fuzzy, Semantic)
-        - 若未提供 output_parser, 使用 CompositeParser(ReActParser, FunctionCallParser)
+        - 若未提供 match_strategy, 使用默认 MatchStrategyChain(Exact, Fuzzy, Semantic, Agent)
+        - 若未提供 output_parser, 使用 CompositeParser(FunctionCallParser, ReActParser, FallbackParser)
         """
 
     def run(self, system_message: Message, user_input: str) -> ReActResult:
