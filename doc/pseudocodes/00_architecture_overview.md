@@ -169,8 +169,8 @@ FUNCTION DataSendFlow(session, user_data):
     //    a. 检查发送窗口余量 → 窗口内分段通过OutputCallback输出
     //    b. OutputCallback → Socket.SendTo → 网络
     //    c. 记录各分段的序列号和发送时间 (用于RTO/重传判定)
-    // 步骤7: Update后若发送成功,统计计数器更新在引擎回调中进行
-    //    (bytes_sent, messages_sent 在引擎确认交付后递增)
+    // 步骤7: Session::Send()中即时更新统计计数器
+    //    (bytes_sent, messages_sent 在数据成功入队后递增于 Session::Send 方法内)
 
     result = session.Send(user_data)
     IF result == SendResult::kQueued:
@@ -259,10 +259,10 @@ FUNCTION ConfigureProtocol(session, profile: ProtocolProfile):
     // 可选协议引擎: KCP (kEngineKCP, 默认) / QUIC (kEngineQUIC)
 
     // 预定义Profile示例:
-    //   kFastMode:     nodelay=1, interval=10, resend=2, fc=false
-    //   kReliableMode: nodelay=0, interval=100, resend=0, fc=true
-    //   kBalancedMode: nodelay=1, interval=20, resend=2, fc=true
-    //   kCustom:       用户直接设置Config各字段
+    //   kFastMode:     nodelay=1, interval=10, resend=2, flow_control=false
+    //   kReliableMode: nodelay=0, interval=100, resend=0, flow_control=true
+    //   kBalancedMode: nodelay=1, interval=20, resend=2, flow_control=true
+    //   kCustom:       用户直接设置Config各字段 (继承自Config{}初始值,即kFastMode默认值)
 
     config = Session::Config::FromProfile(profile)
     // 在预设基础上微调 (可选):
@@ -307,15 +307,15 @@ FUNCTION ConfigureProtocol(session, profile: ProtocolProfile):
    └──────────┘  └──────────────┘  └──────────────┘
 
    关键扩展点:
-   0. ConfigurationMgr — 从JSON文件加载全库配置,支持环境变量/命令行覆盖和热重载
-   0.1 LogManager      — 日志输出回调由外部注入,支持编译期级别裁剪和运行时级别过滤
-   1. Protocol Engine  — 实现统一接口即可替换为任意可靠传输协议 (内置KCP和QUIC两种实现)
-   2. DatagramSocket   — 适配UDPLite/RAW Socket/模拟测试层
-   3. TaskQueue        — 可替换为无锁MPSC队列/优先级队列/有界队列
-   4. TimerService     — 可替换为高精度定时器/分层时间轮
-   5. IOBackend        — 可替换为epoll(Linux/Android)/IOCP(Windows)/kqueue(macOS/BSD/iOS)/poll(回退)
-   6. JSON Parser      — 可替换为nlohmann/json / simdjson / rapidjson (配置解析层)
-   7. LogSink          — 可替换日志输出目标 (stdout/stderr/文件/远程syslog/自定义回调)
+   1. ConfigurationMgr — 从JSON文件加载全库配置,支持环境变量/命令行覆盖和热重载
+   2. LogManager       — 日志输出回调由外部注入,支持编译期级别裁剪和运行时级别过滤
+   3. Protocol Engine  — 实现统一接口即可替换为任意可靠传输协议 (内置KCP和QUIC两种实现)
+   4. DatagramSocket   — 适配UDPLite/RAW Socket/模拟测试层
+   5. TaskQueue        — 可替换为无锁MPSC队列/优先级队列/有界队列
+   6. TimerService     — 可替换为高精度定时器/分层时间轮
+   7. IOBackend        — 可替换为epoll(Linux/Android)/IOCP(Windows)/kqueue(macOS/BSD/iOS)/poll(回退)
+   8. JSON Parser      — 可替换为nlohmann/json / simdjson / rapidjson (配置解析层)
+   9. LogSink          — 可替换日志输出目标 (stdout/stderr/文件/远程syslog/自定义回调)
 ```
 
 ## 5. 线程模型 (多策略可配置)
@@ -401,4 +401,5 @@ STRUCT Session::Config:       // 会话级协议配置
     .recv_window_packets      // int                      接收窗口(包数)
     .rx_buffer_init_bytes     // size_t                   接收缓冲初始大小
     .tx_buffer_init_bytes     // size_t                   发送缓冲初始大小
+    .enable_metrics           // bool                     是否启用运行时统计
 ```

@@ -21,6 +21,9 @@ CLASS Server:
     // -------------------- 类型别名 --------------------
     USING NewSessionHandler     = std::move_only_function<void(std::shared_ptr<Session>)>
     USING SessionEvictedHandler = std::move_only_function<void(uint32_t conv, EvictReason)>
+    // 注意: 当前使用uint32_t作为会话键,不同来源使用相同conv值时会产生冲突
+    // 缓解方案: 使用复合键 std::tuple<uint32_t, std::string, uint16_t> (conv, sender_ip, sender_port)
+    // 或服务端在首次响应中分配新的服务端conv,建立conv映射表以避免冲突
     USING SessionMap            = std::unordered_map<uint32_t, std::shared_ptr<Session>>
 
     ENUM ServerState:
@@ -86,6 +89,18 @@ CLASS Server:
         // 注册Socket可读事件: 数据报到达时回调 OnReadable()
         socket_.SetReadHandler(this)
 
+        // 启动周期性Session协议驱动定时器 (驱动所有Session的协议状态机)
+        // 周期: Session::Config::update_interval_ms (默认10ms)
+        // 这是协议引擎正常工作的必要条件:
+        //   - 驱动数据发送 (窗口内数据分片发出)
+        //   - 驱动重传判定 (RTO超时/快速重传)
+        //   - 驱动ACK发送和RTT估算
+        //   - 驱动流控状态更新 (如启用)
+        drive_timer_ = event_loop_.AddPeriodicTimer(
+            config_.session_config.update_interval_ms,
+            [this](){ DriveAllSessions() }
+        )
+
         // 启动周期性健康检测定时器
         health_timer_ = event_loop_.AddPeriodicTimer(
             config_.health_check_interval_ms,
@@ -99,8 +114,9 @@ CLASS Server:
         LOG_INFO("Server stopped: {} sessions active at shutdown",
                  sessions_.size())
 
-        // 取消健康检测定时器 (生命周期安全: 在清理会话前取消)
+        // 取消健康检测定时器和协议驱动定时器 (生命周期安全: 在清理会话前取消)
         event_loop_.CancelTimer(health_timer_)
+        event_loop_.CancelTimer(drive_timer_)
 
         // 根据驱逐策略处理所有现存会话
         FOR EACH (conv, session) IN sessions_:
@@ -200,6 +216,19 @@ CLASS Server:
     FUNCTION GetSessionCount() -> size_t:
         RETURN sessions_.size()
 
+    FUNCTION GetEventLoop() -> EventLoop*:
+        RETURN event_loop_
+
+    // -------------------- 会话协议驱动 --------------------
+
+    PRIVATE FUNCTION DriveAllSessions() -> void:
+        now = Clock::NowMs()
+        FOR EACH (conv, session) IN sessions_:
+            session->Update(now)
+        // 协议引擎在Update中通过OutputCallback输出:
+        //   新数据发送 / 重传 / ACK确认 / 探活响应 / WINS窗口更新
+        // OutputCallback已由Session构造时绑定到socket_->SendTo
+
     // -------------------- 健康检测 --------------------
 
     PRIVATE FUNCTION RunHealthCheck() -> void:
@@ -225,15 +254,10 @@ CLASS Server:
         LOG_DEBUG("Server health check: {} sessions, {} idle, {} stale",
                   sessions_.size(), idle_count, stale_conv_list.size())
 
-        // 批量驱逐过期会话 (避免在遍历中修改sessions_)
+        // 批量驱逐过期会话 (通过RemoveSession集中处理,避免重复erase+evict逻辑)
         FOR EACH conv IN stale_conv_list:
             LOG_WARN("Server: session conv={} timed out (stale), evicting", conv)
-        FOR EACH conv IN stale_conv_list:
-            it = sessions_.find(conv)
-            IF it != sessions_.end():
-                session = it->second
-                sessions_.erase(it)
-                EvictSession(session, EvictReason::kTimedOut)
+            RemoveSession(conv, EvictReason::kTimedOut)
 
     // -------------------- 私有辅助 --------------------
 
@@ -284,11 +308,17 @@ CLASS Server:
     PRIVATE FUNCTION ExtractRoutingKey(
             data: const uint8_t*, len: size_t
     ) -> std::optional<uint32_t>:
-        // KCP:  conv 位于偏移0, 4字节大端无符号整数
-        // QUIC: Connection ID 位于偏移0 (长头) 或 偏移1 (短头),长度可变(0-20字节)
-        //       取后4字节哈希或使用SCID作为路由键
-        // 其他协议可能有不同偏移或更复杂的提取逻辑 (如SIP的Call-ID哈希)
-        IF len < 4: RETURN std::nullopt
+        // KCP:  conv 位于偏移0, 4字节大端无符号整数; 最小头部24字节
+        // QUIC: Connection ID提取逻辑根据引擎类型不同:
+        //   - 长头 (Initial/Handshake): HeaderForm(1) + Reserved(2) + Version(4) +
+        //     DCIL(1) + DCID(variable) + SCIL(1) + SCID(variable),取SCID哈希
+        //   - 短头 (1-RTT): HeaderForm(1) + CID(variable),取CID哈希
+        // 为确保协议无关,当engine_type为kEngineQUIC时应调用
+        // ProtocolEngine::ExtractRoutingKey(data, len) 以委托协议特定解析
+        IF len < MIN_HEADER_SIZE: RETURN std::nullopt
+        IF config_.session_config.engine_type == EngineType::kEngineQUIC:
+            RETURN engine_.ExtractRoutingKey(data, len)
+        // KCP (默认): conv位于偏移0,4字节大端无符号整数
         RETURN ReadBigEndianU32(data, 0)
 
     // -------------------- 成员变量 --------------------
@@ -299,7 +329,8 @@ CLASS Server:
     PRIVATE MEMBER sessions_: SessionMap                            // conv → Session映射
     PRIVATE MEMBER new_session_handler_: NewSessionHandler
     PRIVATE MEMBER session_evicted_handler_: SessionEvictedHandler
-    PRIVATE MEMBER health_timer_: TimerHandle
+    PRIVATE MEMBER health_timer_: TimerHandle = 0                   // 健康检测定时器句柄
+    PRIVATE MEMBER drive_timer_: TimerHandle = 0                    // 协议驱动定时器句柄
     PRIVATE MEMBER recv_buf_: std::vector<uint8_t>                  // 接收缓冲区 (resize后size=可用长度)
 ```
 

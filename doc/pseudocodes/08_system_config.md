@@ -44,7 +44,7 @@ CLASS ConfigurationManager:
         log_level: string = "info"             // "trace" / "debug" / "info" / "warn" / "error"
         log_output: string = "stdout"          // "stdout" / "stderr" / "callback" / 文件路径
         metrics_output: string = ""            // 指标输出目标 (空=不输出, "prometheus://:9090"等)
-        max_worker_threads: int = 0            // 最大工作线程数 (0=硬件并发数)
+        max_worker_threads: uint32_t = 0       // 最大工作线程数 (0=硬件并发数)
 
     // Socket默认配置
     STRUCT SocketConfig:
@@ -65,50 +65,50 @@ CLASS ConfigurationManager:
         mtu_bytes: int = 1400                  // 最大传输单元(字节)
         send_window_packets: int = 128         // 发送窗口(包数)
         recv_window_packets: int = 128         // 接收窗口(包数)
-        rx_buffer_init_bytes: size_t = 65536    // 接收缓冲初始大小(64KB)
-        tx_buffer_init_bytes: size_t = 65536    // 发送缓冲初始大小(64KB)
+        rx_buffer_init_bytes: size_t = 65536   // 接收缓冲初始大小(64KB)
+        tx_buffer_init_bytes: size_t = 65536   // 发送缓冲初始大小(64KB)
         enable_metrics: bool = true            // 会话级指标收集
 
     // 服务端端点配置
     STRUCT ServerEndpointConfig:
         enabled: bool = false                  // 是否启用Server端点
         listen_ip: string = "0.0.0.0"         // 监听IP
-        listen_port: int = 8888                // 监听端口
+        listen_port: uint16_t = 8888           // 监听端口 (0-65535)
         address_family: string = "ipv4"        // "ipv4" / "ipv6"
-        max_sessions: int = 0                  // 最大会话数 (0=不限制)
-        health_check_interval_ms: int = 1000   // 健康检测周期(ms)
-        idle_timeout_ms: int = 15000           // 空闲判定阈值(ms)
-        stale_timeout_ms: int = 30000          // 过期驱逐阈值(ms)
+        max_sessions: uint32_t = 0             // 最大会话数 (0=不限制)
+        health_check_interval_ms: uint32_t = 1000  // 健康检测周期(ms)
+        idle_timeout_ms: uint32_t = 15000      // 空闲判定阈值(ms)
+        stale_timeout_ms: uint32_t = 30000     // 过期驱逐阈值(ms)
         eviction_policy: string = "immediate"  // "immediate" / "graceful" / "notify_only"
         idle_policy: string = "probe"          // "ignore" / "probe" / "notify"
         socket_config: SocketConfig            // 端点级Socket配置 (覆盖全局socket_defaults)
-        recv_buf_init_bytes: int = 65536       // 接收缓冲区初始大小
+        recv_buf_init_bytes: size_t = 65536    // 接收缓冲区初始大小
 
     // 客户端端点配置
     STRUCT ClientEndpointConfig:
         enabled: bool = false                  // 是否启用Client端点
         remote_ip: string = "127.0.0.1"       // 目标服务器地址
-        remote_port: int = 8888                // 目标服务器端口
+        remote_port: uint16_t = 8888           // 目标服务器端口 (0-65535)
         address_family: string = "ipv4"        // "ipv4" / "ipv6"
         local_bind_ip: string = "0.0.0.0"     // 本地绑定地址
-        local_bind_port: int = 0               // 本地绑定端口 (0=随机)
-        connect_timeout_ms: int = 5000         // 连接超时(ms)
+        local_bind_port: uint16_t = 0          // 本地绑定端口 (0=随机)
+        connect_timeout_ms: uint32_t = 5000    // 连接超时(ms)
         socket_config: SocketConfig            // 端点级Socket配置 (覆盖全局socket_defaults)
-        recv_buf_init_bytes: int = 65536       // 接收缓冲区初始大小
+        recv_buf_init_bytes: size_t = 65536    // 接收缓冲区初始大小
         reconnect: ReconnectConfig             // 重连配置
 
     // 重连策略配置
     STRUCT ReconnectConfig:
         enabled: bool = true                   // 是否启用重连
-        initial_delay_ms: int = 1000           // 初始重连间隔
-        max_delay_ms: int = 30000              // 最大重连间隔
+        initial_delay_ms: uint32_t = 1000      // 初始重连间隔
+        max_delay_ms: uint32_t = 30000         // 最大重连间隔
         backoff_factor: float = 2.0            // 退避因子
-        max_attempts: int = 5                  // 最大重试次数 (0=无限)
-        jitter_ms: int = 200                   // 随机抖动范围
+        max_attempts: uint32_t = 5             // 最大重试次数 (0=无限)
+        jitter_ms: uint32_t = 200              // 随机抖动范围
 
     // Worker线程池配置
     STRUCT WorkerPoolConfig:
-        num_workers: int = 0                   // Worker线程数 (0=硬件并发数)
+        num_workers: uint32_t = 0              // Worker线程数 (0=硬件并发数)
         dispatch_strategy: string = "modulo"   // "modulo" / "consistent_hash" / "round_robin" / "least_sessions"
 
     // -------------------- 构造 --------------------
@@ -329,6 +329,8 @@ CLASS ConfigurationManager:
             out.idle_policy = json["idle_policy"].AsString()
         IF json.Has("recv_buf_init_bytes"):
             out.recv_buf_init_bytes = json["recv_buf_init_bytes"].AsInt()
+        IF json.Has("socket_config"):
+            DeserializeSocketDefaults(json["socket_config"], out.socket_config)
         RETURN true
 
     PRIVATE FUNCTION DeserializeClient(json: JsonValue, out: ClientEndpointConfig&) -> bool:
@@ -350,6 +352,8 @@ CLASS ConfigurationManager:
             out.connect_timeout_ms = json["connect_timeout_ms"].AsInt()
         IF json.Has("recv_buf_init_bytes"):
             out.recv_buf_init_bytes = json["recv_buf_init_bytes"].AsInt()
+        IF json.Has("socket_config"):
+            DeserializeSocketDefaults(json["socket_config"], out.socket_config)
         IF json.Has("reconnect"):
             DeserializeReconnectConfig(json["reconnect"], out.reconnect)
         RETURN true
@@ -402,17 +406,18 @@ CLASS ConfigurationManager:
             warnings.Push("MTU out of range (500-9000): " + ToString(config->session_defaults.mtu_bytes))
 
         // 5. 端口号范围检查
-        IF config->server.enabled AND
-           (config->server.listen_port < 0 OR config->server.listen_port > 65535):
-            warnings.Push("Invalid server port: " + ToString(config->server.listen_port))
+        IF config->server.enabled AND config->server.listen_port == 0:
+            warnings.Push("Server listen_port should not be 0 (use specific port)")
+        IF config->client.enabled AND config->client.remote_port == 0:
+            warnings.Push("Client remote_port should not be 0 (must specify server port)")
 
         // 6. 超时逻辑一致性
         IF config->server.idle_timeout_ms >= config->server.stale_timeout_ms:
             warnings.Push("idle_timeout_ms must be < stale_timeout_ms")
 
         // 7. 退避因子逻辑检查
-        IF config->client.reconnect.enabled AND config->client.reconnect.backoff_factor <= 1.0:
-            warnings.Push("backoff_factor should be > 1.0 for exponential backoff")
+        IF config->client.reconnect.enabled AND config->client.reconnect.backoff_factor < 1.0f:
+            warnings.Push("backoff_factor should be >= 1.0 (1.0=固定间隔, >1.0=指数退避)")
 
         // 8. 窗口大小与MTU逻辑一致性
         IF config->session_defaults.send_window_packets < 4:
@@ -434,9 +439,12 @@ CLASS ConfigurationManager:
         // - 必填字段缺失 (如Server enabled但未配置listen_port)
         // 此处仅举例:
         IF config->server.enabled AND config->client.enabled:
-            IF config->server.listen_port == config->client.remote_port AND
-               config->server.listen_ip == config->client.remote_ip:
-                LOG_ERROR("Server and Client cannot share the same address:port")
+            // 检查Server绑定地址与Client本地绑定地址是否冲突
+            // (非Server监听端口与Client远程端口 — 两者语义不同,不冲突)
+            IF config->server.listen_port == config->client.local_bind_port AND
+               config->server.listen_ip == config->client.local_bind_ip AND
+               config->client.local_bind_port != 0:   // 0=随机端口,无冲突
+                LOG_ERROR("Server bind address conflicts with Client local bind address")
                 RETURN true
         RETURN false
 

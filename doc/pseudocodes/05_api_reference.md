@@ -1035,6 +1035,8 @@ public:
     std::span<const uint8_t> AsSpan() const;           // span视图 (零拷贝,需C++20或polyfill)
     std::string_view AsStringView() const;             // 字符串视图 (零拷贝, C++17)
     std::vector<uint8_t> TakeBytes();                  // 移动取出所有权 (跨线程传递,避免拷贝)
+                                                     // 注意: 调用后Message内部data_为空,
+                                                     // 后续Data()/Size()/AsSpan()/AsStringView()返回空/0
 
     uint32_t session_id;                               // 来源会话ID (routing_key)
     uint64_t receive_time_ms;                          // 接收时间戳 (Clock::NowMs)
@@ -1060,10 +1062,18 @@ STRUCT ParseResult:
     bytes_consumed: size_t    // 此次Input消耗的字节数
 
     STATIC FUNCTION Ok(consumed: size_t) -> ParseResult:
-        RETURN ParseResult{.success=true, .error=std::nullopt, .bytes_consumed=consumed}
+        result = ParseResult{}
+        result.success = true
+        result.error = std::nullopt
+        result.bytes_consumed = consumed
+        RETURN result
 
     STATIC FUNCTION Err(e: SessionError) -> ParseResult:
-        RETURN ParseResult{.success=false, .error=e, .bytes_consumed=0}
+        result = ParseResult{}
+        result.success = false
+        result.error = e
+        result.bytes_consumed = 0
+        RETURN result
 
 CLASS ProtocolEngine:
     // -------------------- 生命周期回调 --------------------

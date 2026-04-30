@@ -92,13 +92,14 @@ TEST TaskQueue_TryPop_NonBlocking:
     //         要么返回nullopt; 不会返回"半任务"或损坏数据
     //       TSan验证无数据竞争
 
-// 2.5 有界队列背压 (如替换为有界实现时的测试要求)
+// 2.5 有界队列背压 (仅在替换为有界队列实现时启用)
+// 当前默认实现为无界队列 (std::queue),此测试针对BoundedTaskQueue变体
+// 当编译期通过TaskQueueVariant= kBounded启用有界实现后,此测试自动激活
 TEST TaskQueue_Bounded_Backpressure:
-    // 配置: 队列容量上限 = K (如K=1024)
+    // 前置: 使用BoundedTaskQueue (capacity=1024) 变体
     // 验证: Push在队列元素数==K时阻塞 (或返回false,取决于实现)
     //       Pop消费一个任务后,阻塞的Push被唤醒并成功入队 (背压释放)
     //       队列元素数始终不超过K
-    // 注意: 当前默认实现为无界队列,此测试针对BoundedTaskQueue变体
 ```
 
 ---

@@ -193,6 +193,12 @@ CLASS DatagramSocket:
         STATIC FUNCTION From(ip: string, port: uint16_t) -> Address:
             RETURN Address{.ip = ip, .port = port, .family = DetectFamily(ip)}
 
+        // 返回人类可读的地址表示: "ip:port" 或 "unix:/path" (Unix Domain)
+        FUNCTION ToString() -> std::string:
+            IF family == AddressFamily::kUnixDomain:
+                RETURN "unix:" + ip
+            RETURN ip + ":" + std::to_string(port)
+
     // 接收结果: 数据指针指向调用方传入的缓冲区
     // 调用方必须在RecvResult生命周期内保持buffer有效
     STRUCT RecvResult:
@@ -253,13 +259,16 @@ CLASS DatagramSocket:
             len: size_t,             // [in] 数据长度
             dest: Address            // [in] 目标地址
     ) -> std::expected<int, SocketError>:
-        sent = ::sendto(fd_, data, len, MSG_DONTWAIT,
+        // 非阻塞发送: POSIX使用MSG_DONTWAIT标志,Windows使用已设置的
+        // 非阻塞模式 (ioctlsocket FIONBIO); 平台适配由PlatformDetect在
+        // 编译期选择正确的发送标志或调用方式,SendTo对外保持统一语义
+        sent = ::sendto(fd_, data, len, PLATFORM_SEND_FLAGS,
                         dest.ToSystemSockaddr(), dest.SizeOfSockaddr())
         IF sent >= 0:
             RETURN sent
-        IF errno IS EAGAIN OR errno IS EWOULDBLOCK:
+        IF IS_WOULD_BLOCK_ERROR():
             RETURN std::unexpected(SocketError::kWouldBlock)
-        RETURN std::unexpected(SocketError::FromErrno(errno))
+        RETURN std::unexpected(SocketError::FromErrno(GetLastSocketError()))
 
     // 非阻塞接收,无数据时返回 nullopt, Socket错误时返回错误码
     // 注意: 需先调用 buffer.resize(capacity) 确保 capacity() == size()
@@ -269,7 +278,11 @@ CLASS DatagramSocket:
     ) -> std::expected<std::optional<RecvResult>, SocketError>:
         sender_addr: sockaddr_storage
         addr_len: socklen_t = sizeof(sender_addr)
-        n = ::recvfrom(fd_, buffer, buffer_capacity, MSG_DONTWAIT,
+        sender_addr: sockaddr_storage
+        addr_len: socklen_t = sizeof(sender_addr)
+        // 非阻塞接收: 平台适配标志由PLATFORM_RECV_FLAGS统一处理
+        // (POSIX: MSG_DONTWAIT, Windows: 已设非阻塞模式)
+        n = ::recvfrom(fd_, buffer, buffer_capacity, PLATFORM_RECV_FLAGS,
                        CAST(sockaddr*, &sender_addr), &addr_len)
         IF n > 0:
             RETURN RecvResult{
@@ -278,10 +291,10 @@ CLASS DatagramSocket:
                 .sender        = Address::FromSystem(&sender_addr, addr_len),
                 .timestamp_ms  = Clock::NowMs()
             }
-        IF errno IS EAGAIN OR errno IS EWOULDBLOCK:
+        IF IS_WOULD_BLOCK_ERROR():
             RETURN std::nullopt                          // 无就绪数据
         // 返回值区分: ICMP错误等不影响继续使用Socket,记录日志
-        RETURN std::unexpected(SocketError::FromErrno(errno))
+        RETURN std::unexpected(SocketError::FromErrno(GetLastSocketError()))
 
     // -------------------- 事件循环集成 --------------------
 
@@ -370,6 +383,18 @@ CLASS WorkerPool:
     ) -> void:
         index = SelectWorker(routing_key)
         workers_[index].event_loop.PostTask(std::move(task))
+
+    // 递增/递减Worker的会话计数 (由Server/Client在创建/销毁Session时调用)
+    // 这些方法是WorkerPool的Public API,供端点层使用以维护kLeastSessions准确性
+    FUNCTION IncrementSessionCount(worker_index: size_t) -> void:
+        workers_[worker_index].session_count.fetch_add(1, std::memory_order_relaxed)
+
+    FUNCTION DecrementSessionCount(worker_index: size_t) -> void:
+        workers_[worker_index].session_count.fetch_sub(1, std::memory_order_relaxed)
+
+    // 获取当前Worker数量 (供端点层计算routing_key取模)
+    FUNCTION GetWorkerCount() -> size_t:
+        RETURN workers_.size()
 
     // 选择目标Worker
     PRIVATE FUNCTION SelectWorker(routing_key: uint32_t) -> size_t:
@@ -498,7 +523,10 @@ CLASS TimerQueue:
             RETURN MAX(0, remaining)
 
     // 执行所有已到期的定时器回调
-    // 注意: 回调在锁内执行; 如回调可能耗时,应改为投递到TaskQueue
+    // 注意: 回调在锁内执行; 回调中不得:
+    //   a. 调用TimerQueue的Add/Cancel — 会导致死锁 (mutex_非递归)
+    //   b. 执行长时间阻塞操作 — 会阻塞所有定时器的触发和GetNextTimeout调用
+    // 如回调需要上述操作,应在回调中将任务投递到TaskQueue异步执行
     FUNCTION FireExpired(now: uint64_t) -> void:
         LOCK(mutex_):
             WHILE !heap_.empty() AND heap_.top().expire_time <= now:

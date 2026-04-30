@@ -93,7 +93,9 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
                     config.fast_resend_threshold = 2
                     config.flow_control_enabled = true
                 CASE kCustom:
-                    // 由用户手动设置各字段
+                    // kCustom模式下不做任何预设填充,各字段保持Config{}初始值
+                    // Config{}的默认值恰好与kFastMode一致 (nodelay=1, interval=10,
+                    // resend=2, flow_control=false); 调用方应在FromProfile后逐字段覆盖
             RETURN config
 
     // -------------------- 构造与析构 --------------------
@@ -110,6 +112,7 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
         remote_addr_     = std::move(remote_addr)
         config_          = config
         last_recv_time_ms_ = Clock::NowMs()
+        shutdown_timer_   = TimerHandle::Invalid()   // 初始化为无效句柄 (0)
         recv_buffer_.resize(config_.rx_buffer_init_bytes)
 
         // 创建协议引擎 (可注入: KCP / QUIC / 自定义 / Mock)
@@ -177,7 +180,8 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
 
     FUNCTION Send(data: const uint8_t*, len: size_t) -> SendResult:
         IF state_ != kConnected:
-            LOG_WARN("Session conv={}: send blocked (state={})",
+            // 状态不允许发送: 未连接/正在关闭/已关闭
+            LOG_WARN("Session conv={}: send blocked due to state={}",
                      conv_, StateToString(state_))
             RETURN SendResult::kBlocked
         result = engine_.Send(data, len)
@@ -185,7 +189,8 @@ CLASS Session : PUBLIC std::enable_shared_from_this<Session>:
             stats_.total_bytes_sent += len
             stats_.total_messages_sent += 1
         ELSE:
-            LOG_WARN("Session conv={}: send blocked (window_used={})",
+            // kBlocked仅因发送窗口满 (引擎内部判定),非状态问题
+            LOG_WARN("Session conv={}: send blocked due to window full (window_used={})",
                      conv_, stats_.send_window_used)
         RETURN result
 

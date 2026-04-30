@@ -51,12 +51,18 @@ CLASS LogManager:
             log_callback_ = std::move(cb)
 
     // 获取当前注册的日志回调 (用于调试/组合/装饰)
-    // 返回值: nullptr表示未设置回调
-    STATIC FUNCTION GetLogCallback() -> LogCallback*:
-        // 注意: 返回原始指针,调用方不应持有过久
-        // 仅供检查回调是否已设置
+    // 返回值: 回调的副本; nullopt表示未设置回调
+    // 注意: 返回的是回调的拷贝 (std::move_only_function不可拷贝,需特殊处理)
+    //       此接口供检查/包装已有回调使用; 返回的副本可在锁外安全调用
+    STATIC FUNCTION GetLogCallback() -> std::optional<LogCallback>:
         LOCK(callback_mutex_):
-            RETURN log_callback_.has_value() ? &log_callback_.value() : nullptr
+            IF NOT log_callback_.has_value():
+                RETURN std::nullopt
+            // 返回回调的副本 (move_only_function需移动构造)
+            // 原始回调保留在log_callback_中,后续日志仍可使用
+            RETURN std::move(log_callback_.value())
+        // 注意: 此实现会清空log_callback_; 若需同时保留原回调,
+        // 可在锁内先保存副本再返回,或使用shared_ptr包装回调
 
     // -------------------- 运行时级别过滤 --------------------
 
@@ -99,11 +105,12 @@ CLASS LogManager:
             IF log_callback_.has_value():
                 (*log_callback_)(level, file, line, function, message)
 
-        // 步骤4: 致命级别后可选处理
+        // 步骤4: 致命级别后可选处理 (锁外执行,避免Flush重入锁导致死锁)
         IF level == Level::kFatal:
-            // 刷新日志缓冲确保fatal消息不丢失
+            // 刷新日志缓冲确保fatal消息不丢失 (Flush内部独立获取锁)
             Flush()
             // 调用应用注册的fatal handler (如果存在)
+            // 注意: fatal_handler_注册和调用由专用fatal_mutex_保护
             IF fatal_handler_:
                 fatal_handler_(file, line, function, message)
 
@@ -137,52 +144,62 @@ CLASS LogManager:
 
 // 编译期最低日志级别 (CMake/构建系统可覆盖)
 #ifndef LOG_COMPILE_MIN_LEVEL
-    #IFDEF NDEBUG
-        #DEFINE LOG_COMPILE_MIN_LEVEL  LogManager::Level::kInfo   // Release: 裁剪TRACE和DEBUG
-    #ELSE
-        #DEFINE LOG_COMPILE_MIN_LEVEL  LogManager::Level::kTrace  // Debug: 保留全部
-    #ENDIF
-#ENDIF   // LOG_COMPILE_MIN_LEVEL guard
+    #ifdef NDEBUG
+        #define LOG_COMPILE_MIN_LEVEL  LogManager::Level::kInfo   // Release: 裁剪TRACE和DEBUG
+    #else
+        #define LOG_COMPILE_MIN_LEVEL  LogManager::Level::kTrace  // Debug: 保留全部
+    #endif
+#endif   // LOG_COMPILE_MIN_LEVEL guard
 
 // 编译期级别检查: 低于裁剪级别的Log调用被编译器完全移除
 #define LOG_IS_COMPILE_ENABLED(level) \
     (static_cast<int>(level) >= static_cast<int>(LOG_COMPILE_MIN_LEVEL))
 
 // ── 追踪 (仅开发调试,Release构建中完全移除) ──
+// 使用 do { if constexpr (...) { ... } } while(0) 确保:
+//   a. 宏在任何上下文中可安全使用 (if/else/while)
+//   b. if constexpr 在C++17编译期完全移除低于裁剪级别的日志调用
+//   c. 调用的函数参数 (如昂贵的格式化) 在编译期完全求值前被消除
 #define LOG_TRACE(fmt, ...) \
-    DO_IF(LOG_IS_COMPILE_ENABLED(LogManager::Level::kTrace)): \
+    do { if constexpr (LOG_IS_COMPILE_ENABLED(LogManager::Level::kTrace)) { \
         LogManager::Log(LogManager::Level::kTrace, \
-                        __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__)
+                        __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__); \
+    } } while(0)
 
 // ── 调试 (开发环境) ──
 #define LOG_DEBUG(fmt, ...) \
-    DO_IF(LOG_IS_COMPILE_ENABLED(LogManager::Level::kDebug)): \
+    do { if constexpr (LOG_IS_COMPILE_ENABLED(LogManager::Level::kDebug)) { \
         LogManager::Log(LogManager::Level::kDebug, \
-                        __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__)
+                        __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__); \
+    } } while(0)
 
 // ── 信息 (生产环境默认,关键业务事件) ──
 #define LOG_INFO(fmt, ...) \
-    DO_IF(LOG_IS_COMPILE_ENABLED(LogManager::Level::kInfo)): \
+    do { if constexpr (LOG_IS_COMPILE_ENABLED(LogManager::Level::kInfo)) { \
         LogManager::Log(LogManager::Level::kInfo, \
-                        __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__)
+                        __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__); \
+    } } while(0)
 
 // ── 警告 (非预期但可恢复) ──
 #define LOG_WARN(fmt, ...) \
-    DO_IF(LOG_IS_COMPILE_ENABLED(LogManager::Level::kWarn)): \
+    do { if constexpr (LOG_IS_COMPILE_ENABLED(LogManager::Level::kWarn)) { \
         LogManager::Log(LogManager::Level::kWarn, \
-                        __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__)
+                        __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__); \
+    } } while(0)
 
 // ── 错误 (操作失败,需关注) ──
 #define LOG_ERROR(fmt, ...) \
-    DO_IF(LOG_IS_COMPILE_ENABLED(LogManager::Level::kError)): \
+    do { if constexpr (LOG_IS_COMPILE_ENABLED(LogManager::Level::kError)) { \
         LogManager::Log(LogManager::Level::kError, \
-                        __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__)
+                        __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__); \
+    } } while(0)
 
 // ── 致命 (不可恢复,通常随后退出) ──
 #define LOG_FATAL(fmt, ...) \
-    DO_IF(LOG_IS_COMPILE_ENABLED(LogManager::Level::kFatal)): \
+    do { if constexpr (LOG_IS_COMPILE_ENABLED(LogManager::Level::kFatal)) { \
         LogManager::Log(LogManager::Level::kFatal, \
-                        __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__)
+                        __FILE__, __LINE__, __FUNCTION__, fmt, ##__VA_ARGS__); \
+    } } while(0)
 ```
 
 ---

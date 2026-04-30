@@ -17,6 +17,9 @@
 //       线程安全: 所有操作在所属EventLoop线程执行,无需内部锁
 // ============================================================
 CLASS Client:
+    // -------------------- 常量 --------------------
+    CONST kMaxConsecutiveRecvErrors: int = 16   // 连续RecvFrom错误上限 (防止Socket损坏导致忙等)
+
     // -------------------- 类型别名 --------------------
     USING ConnectSuccessHandler = std::move_only_function<void(std::shared_ptr<Session>)>
     USING ConnectFailureHandler = std::move_only_function<void(ConnectError)>
@@ -85,7 +88,7 @@ CLASS Client:
         LOG_INFO("Client: connecting to {}:{}",
                  config_.remote_address.ip, config_.remote_address.port)
 
-        // 如果当前有活跃连接,先断开
+        // 如果当前有活跃连接,先断开 (包括kReconnecting状态)
         IF state_ != ClientState::kDisconnected AND state_ != ClientState::kClosed:
             Disconnect()
 
@@ -302,7 +305,16 @@ CLASS Client:
         session->OnStateChange([this](SessionState old_state, SessionState new_state):
             IF new_state == SessionState::kClosed:
                 IF state_ == ClientState::kConnected:
-                    state_ = ClientState::kDisconnected
+                    // 已建立的连接被关闭 (超时/被服务器关闭/协议错误)
+                    // 尝试重连或通告失败,与OnError路径保持一致
+                    IF config_.reconnect.has_value():
+                        state_ = ClientState::kReconnecting
+                        event_loop_.PostTask([this]():
+                            DoConnect()
+                        )
+                    ELSE:
+                        state_ = ClientState::kDisconnected
+                        NotifyConnectFailure(ConnectError::kSocketError)
         )
 
     PRIVATE FUNCTION NotifyConnectFailure(error: ConnectError) -> void:

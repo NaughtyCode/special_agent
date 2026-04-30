@@ -32,7 +32,22 @@
 | **iOS** | kqueue (Darwin 内核) | pipe 或 kqueue user event |
 | **通用回退** | POSIX poll | pipe |
 
-- 平台自动检测: `IOBackend::kAutoDetect` → `PlatformDetect::BestAvailable()`
+- 平台自动检测: `IOBackend::kAutoDetect` → `PlatformDetect::BestAvailable()`:
+  ```
+  // PlatformDetect 伪代码 (编译期平台识别)
+  namespace PlatformDetect {
+      IOBackend BestAvailable():
+          #if defined(__linux__) || defined(__ANDROID__)
+              return IOBackend::kEpoll
+          #elif defined(_WIN32)
+              return IOBackend::kIocp
+          #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+              return IOBackend::kKqueue
+          #else
+              return IOBackend::kPoll      // 通用POSIX回退
+          #endif
+  }
+  ```
 - 也可手动指定后端: `kEpoll` (Linux/Android) / `kIocp` (Windows) / `kKqueue` (macOS/BSD/iOS) / `kPoll` (回退)
 - Android 通过 NDK 编译,使用 Linux 内核的 epoll 和 eventfd 机制
 - iOS 通过 Xcode 编译,使用 Darwin 内核的 kqueue 机制 (与 macOS 相同)
@@ -87,7 +102,7 @@
 | **多路复用** | 单流 (不区分流ID) | 多流 (Stream ID 隔离,无队头阻塞) |
 | **连接迁移** | 不支持 (IP 变更需重新握手) | 支持 (Connection ID 不变,IP 切换自动恢复) |
 | **拥塞控制** | 固定窗口 (可配置) | 可插拔拥塞算法 (NewReno / Cubic / BBR) |
-| **头部开销** | 24 字节 (固定) | 1-20 字节 (短头 1 字节,长头最多 20 字节) |
+| **头部开销** | 24 字节 (固定) | 1-25+ 字节 (短头: 1B type + 0-20B CID + 1-4B PN; 长头: 1B type + 4B version + DCIL+DCID+SCIL+SCID + 1-4B PN) |
 | **实现复杂度** | 低 (~2000 行 C) | 高 (需 TLS 库集成,~数万行) |
 | **适用场景** | 局域网/私有网游戏,低延迟优先 | 公网/移动端游戏,需要安全加密和连接迁移 |
 | **外部依赖** | 仅 ikcp.c/ikcp.h (无其他依赖) | TLS 库 (如 BoringSSL / OpenSSL / PicoTLS) |
