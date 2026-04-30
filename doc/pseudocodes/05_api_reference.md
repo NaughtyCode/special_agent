@@ -490,7 +490,7 @@ void OnReadable()
 ```
 类名: EventLoop
 头文件: event_loop.h
-描述: 跨平台IO事件循环抽象,统一封装epoll/IOCP/kqueue/poll
+描述: 跨平台IO事件循环抽象,统一封装epoll(Linux/Android)/IOCP(Windows)/kqueue(macOS/BSD/iOS)/poll(回退)
      线程安全: Stop可从任何线程调用; Run在调用线程阻塞执行;
               Register/Modify/Unregister必须在EventLoop所属线程调用
 ```
@@ -500,9 +500,9 @@ void OnReadable()
 ```
 enum class IOBackend {
     kAutoDetect,  // 自动选择当前平台最优IO模型
-    kEpoll,       // Linux epoll
+    kEpoll,       // Linux/Android epoll
     kIocp,        // Windows IOCP
-    kKqueue,      // macOS/BSD kqueue
+    kKqueue,      // macOS/BSD/iOS kqueue
     kPoll         // POSIX poll (通用回退方案)
 };
 

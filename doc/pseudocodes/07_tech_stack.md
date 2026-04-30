@@ -26,12 +26,28 @@
 | 平台 | IO 模型 | 唤醒机制 |
 |------|---------|---------|
 | **Linux** | epoll | eventfd |
+| **Android** | epoll (Linux 内核) | eventfd 或 pipe |
 | **Windows** | IOCP (I/O Completion Port) | PostQueuedCompletionStatus |
 | **macOS / BSD** | kqueue | pipe 或 kqueue user event |
+| **iOS** | kqueue (Darwin 内核) | pipe 或 kqueue user event |
 | **通用回退** | POSIX poll | pipe |
 
 - 平台自动检测: `IOBackend::kAutoDetect` → `PlatformDetect::BestAvailable()`
-- 也可手动指定后端: `kEpoll` / `kIocp` / `kKqueue` / `kPoll`
+- 也可手动指定后端: `kEpoll` (Linux/Android) / `kIocp` (Windows) / `kKqueue` (macOS/BSD/iOS) / `kPoll` (回退)
+- Android 通过 NDK 编译,使用 Linux 内核的 epoll 和 eventfd 机制
+- iOS 通过 Xcode 编译,使用 Darwin 内核的 kqueue 机制 (与 macOS 相同)
+
+### 移动平台特殊考量
+
+| 考量点 | 说明 |
+|--------|------|
+| **网络切换** | 移动设备频繁切换网络 (WiFi ↔ 蜂窝),IP 地址可能改变;应用层需感知网络变更并触发重连 |
+| **应用生命周期** | iOS/Android 应用可进入后台/前台,后台时网络 Socket 可能被 OS 暂停或关闭;需在生命周期回调中管理会话的暂停/恢复/重连 |
+| **省电优化** | 移动平台对后台网络活动有严格限制;建议在应用进入后台时降低健康检测频率和协议 Update 频率,或将长连接切换为低功耗心跳模式 |
+| **NDK 编译** | Android 通过 NDK 交叉编译 C++ 代码,需支持 armeabi-v7a / arm64-v8a / x86_64 等多 ABI |
+| **Xcode 集成** | iOS 通过 Xcode 构建,需配置 Framework 或静态库目标,支持 arm64 (真机) 和 x86_64 (模拟器) |
+| **IPv6 就绪** | iOS 应用提交 App Store 要求支持 IPv6-only 网络;库的 `AddressFamily::kIPv6` 和地址解析需完整支持 |
+| **蜂窝网络特征** | 蜂窝网络延迟波动大 (50-500ms)、丢包率高;协议配置应支持高延迟网络下的适应性调参 (增大 RTO 下限,启用流控) |
 
 ---
 
@@ -39,7 +55,7 @@
 
 | 组件 | 选型 | 说明 |
 |------|------|------|
-| **事件循环** | EventLoop (统一抽象) | 封装 epoll/IOCP/kqueue/poll, Pimpl 惯用法隐藏平台差异 |
+| **事件循环** | EventLoop (统一抽象) | 封装 epoll(Linux/Android)/IOCP(Windows)/kqueue(macOS/BSD/iOS)/poll(回退), Pimpl 惯用法隐藏平台差异 |
 | **触发模式** | 边缘触发 (Edge-Triggered) | `EPOLLET` / `kEdgeTriggered`,推荐用于高性能场景 |
 | **Socket 类型** | 非阻塞数据报 (SOCK_DGRAM) | 支持 UDP / UDPLite / Unix Domain Dgram / RAW |
 | **Socket API** | POSIX `sendto` / `recvfrom` | `MSG_DONTWAIT` 标志确保非阻塞 |
@@ -184,7 +200,7 @@
 | 依赖 | 用途 | 备注 |
 |------|------|------|
 | **KCP (ikcp.c/ikcp.h)** | 默认协议引擎实现 | C API,通过 `ProtocolEngine` 接口封装;可替换 |
-| **POSIX Socket API** | 跨平台网络 IO | Linux/macOS/BSD 原生,Windows 通过 IOCP 适配 |
+| **POSIX Socket API** | 跨平台网络 IO | Linux/Android/macOS/BSD/iOS 原生,Windows 通过 IOCP 适配 |
 | **C++ 标准库** | 容器/线程/原子/智能指针/函数对象 | STL containers, threading, atomics, type traits |
 | **第三方 polyfill (可选)** | 弥补 C++17 与 C++20/23 差距 | `tl::expected` / `fu2::unique_function` / `gsl::span` |
 

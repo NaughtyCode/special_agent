@@ -25,7 +25,7 @@
 │     - 统计收集 (GetStats)                                      │
 ├──────────────────────────────────────────────────────────────┤
 │              Platform Layer (平台抽象层)                         │
-│   EventLoop (epoll / IOCP / kqueue 统一抽象)                   │
+│   EventLoop (epoll / IOCP / kqueue / poll 统一抽象)            │
 │   WorkerPool (线程调度器, 支持多种分配策略)                      │
 │   TimerQueue (定时器服务, 小顶堆/时间轮可替换)                    │
 │   DatagramSocket (数据报Socket抽象, 支持UDP/UDPLite/RAW)        │
@@ -267,7 +267,7 @@ FUNCTION ConfigureProtocol(session, profile: ProtocolProfile):
    2. DatagramSocket   — 适配UDPLite/RAW Socket/模拟测试层
    3. TaskQueue        — 可替换为无锁MPSC队列/优先级队列/有界队列
    4. TimerService     — 可替换为高精度定时器/分层时间轮
-   5. IOBackend        — 可替换为epoll/IOCP/kqueue/poll
+   5. IOBackend        — 可替换为epoll(Linux/Android)/IOCP(Windows)/kqueue(macOS/BSD/iOS)/poll(回退)
 ```
 
 ## 5. 线程模型 (多策略可配置)
@@ -316,7 +316,7 @@ FUNCTION MultiThreadWorkerModel(num_workers):
 // ============================================================
 
 STRUCT LibraryConfig:        // 库级全局配置
-    .io_backend               // kAutoDetect / kEpoll / kIocp / kKqueue / kPoll
+    .io_backend               // kAutoDetect / kEpoll(Linux/Android) / kIocp(Windows) / kKqueue(macOS/BSD/iOS) / kPoll(回退)
     .allocator                // 可替换内存分配器
     .log_sink                 // 日志输出目标
     .metrics_sink             // 指标输出目标 (Prometheus/自定义)

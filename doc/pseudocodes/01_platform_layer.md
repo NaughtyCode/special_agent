@@ -10,7 +10,7 @@
 // ============================================================
 // 类名: EventLoop
 // 描述: 跨平台IO事件循环抽象
-//       封装 epoll(Linux) / IOCP(Windows) / kqueue(macOS/BSD)
+//       封装 epoll(Linux/Android) / IOCP(Windows) / kqueue(macOS/BSD/iOS)
 //       统一接口,调用方无需关心底层IO模型差异
 // ============================================================
 CLASS EventLoop:
@@ -31,6 +31,8 @@ CLASS EventLoop:
     CONSTRUCTOR EventLoop(backend: IOBackend = kAutoDetect):
         // 自动选择当前平台最优IO模型
         // 也可手动指定: kEpoll / kIocp / kKqueue / kPoll (回退方案)
+        // 平台映射: Linux/Android → kEpoll, Windows → kIocp,
+        //          macOS/iOS → kKqueue, 通用回退 → kPoll
         SELECT backend:
             CASE kEpoll:
                 impl_ = CREATE EpollImpl()
@@ -45,8 +47,8 @@ CLASS EventLoop:
 
         // 创建内部唤醒通道 (用于跨线程唤醒阻塞中的事件循环)
         // 各平台实现:
-        //   Linux → eventfd
-        //   macOS/BSD → pipe 或 kqueue user event
+        //   Linux/Android → eventfd
+        //   macOS/BSD/iOS → pipe 或 kqueue user event
         //   Windows → PostQueuedCompletionStatus
         wakeup_channel_ = impl_.CreateWakeupChannel()
 
