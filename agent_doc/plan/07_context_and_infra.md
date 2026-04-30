@@ -181,8 +181,8 @@ class Config:
 
     # ── LLM Provider ────────────────────────────────
     llm_api_key: str                        # API 密钥 (环境变量: LLM_API_KEY)
-    llm_base_url: str = "https://api.deepseek.com"  # API 地址 (LLM_BASE_URL)
-    llm_model: str = "deepseek-chat"        # 默认模型 (LLM_MODEL)
+    llm_base_url: str = "https://api.deepseek.com/anthropic"  # API 地址 (LLM_BASE_URL)
+    llm_model: str = "deepseek-v4-pro"        # 默认模型 (LLM_MODEL)
     llm_max_tokens: int = 4096              # 最大生成 Token (LLM_MAX_TOKENS)
     llm_temperature: float = 0.7            # 采样温度 (LLM_TEMPERATURE)
     llm_timeout: float = 60.0               # 请求超时秒 (LLM_TIMEOUT)
