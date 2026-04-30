@@ -1,0 +1,9 @@
+
+-----------------------------------------------
+
+claude --dangerously-skip-permissions
+
+-----------------------------------------------
+
+1. 按 ./agent_doc/issues/issue1.txt 的要求执行
+2. 按 ./agent_doc/issues/issue2.txt 的要求执行

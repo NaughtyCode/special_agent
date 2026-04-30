@@ -1,0 +1,12 @@
+前提：
+. 生成完整的修改记录文档,修改记录文档放 .\agent_doc\changelog 目录下
+. 代码必须加上详细注释
+
+要求：
+. deepseek v4 API使用下面环境变量获取相关参数：
+	ANTHROPIC_SMALL_FAST_MODEL
+	ANTHROPIC_MODEL
+	ANTHROPIC_CUSTOM_MODEL_OPTION
+	ANTHROPIC_BASE_URL
+	ANTHROPIC_AUTH_TOKEN
+	API_TIMEOUT_MS

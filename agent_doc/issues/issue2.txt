@@ -1,0 +1,13 @@
+功能：设计可继承的Agent框架的计划
+
+前提：
+. 生成完整的修改记录文档,修改记录文档放 .\agent_doc\changelog 目录下
+. 代码必须加上详细注释
+
+要求：
+. 基于Python3开发
+. 有一个基本的Agent：BaseAgent，具体访问LLM的完整的能力、完整的ReAct结构能力
+. 有一个根Agent：RootAgent，继承自BaseAgent，负责处理控制台输入的请求
+. 有一堆特化的Agent，都继承自BaseAgent
+. 支持Tool匹配、拉起以及运行特化的Agent
+. 所有计划文档放.\agent_doc\plan目录下
