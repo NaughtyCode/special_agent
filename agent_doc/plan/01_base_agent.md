@@ -168,7 +168,7 @@ class BaseAgent(ABC):
 
     # ── 内部方法 ──────────────────────────────────────
     def _handle_react_iteration(self, thought: str,
-                                action: ParsedAction) -> Observation:
+                                action: ParsedAction) -> ActionResult:
         """处理单次 ReAct 迭代中的 Action 执行。"""
 
     def _validate_state_transition(self, target: AgentState) -> bool:
@@ -179,6 +179,17 @@ class BaseAgent(ABC):
 ```
 
 ### 2.4 AgentState 状态机
+
+```python
+class AgentState(Enum):
+    """Agent 生命周期状态"""
+    IDLE = "idle"           # 初始/空闲
+    RUNNING = "running"     # 正在执行 ReAct 循环
+    DONE = "done"           # 正常完成
+    ERROR = "error"         # 执行出错
+    STOPPING = "stopping"   # 正在响应停止请求
+    STOPPED = "stopped"     # 已被用户停止
+```
 
 ```
                     ┌───────── stop() ─────────┐
@@ -237,6 +248,12 @@ class AgentResult:
     total_duration_ms: float            # 总执行耗时 (毫秒)
     finish_reason: FinishReason         # DONE / MAX_ITERATIONS / STOPPED / ERROR
     error: AgentError | None = None     # 错误信息 (如有)
+
+@dataclass
+class ParsedAction:
+    """解析后的 Action — 由 ReActEngine 解析 LLM 输出后传递给 BaseAgent"""
+    name: str                           # Action 名称 (Tool 名或 Agent 名)
+    input: dict                         # Action 参数
 ```
 
 ## 3. 子类化指南

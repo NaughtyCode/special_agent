@@ -205,7 +205,8 @@ SpecialAgent/
 ├── tests/                         # 测试目录
 ├── plugins/                       # Agent 插件目录
 ├── changelog/                     # 修改记录 (历史)
-└── doc/                           # 参考文档 (历史)
+├── requirements.txt
+└── README.md
 ```
 
 ## 7. 关键技术决策

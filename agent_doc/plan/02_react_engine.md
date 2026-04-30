@@ -193,6 +193,12 @@ class ReActParser:
 ### 5.1 ParsedReAct 数据模型
 
 ```python
+class ParseMethod(Enum):
+    """LLM 输出解析方式"""
+    TEXT_REACT = "text_react"           # 文本 ReAct 格式解析
+    FUNCTION_CALL = "function_call"     # Function Calling 结构化解析
+    FALLBACK = "fallback"               # 回退解析 (容错)
+
 @dataclass
 class ParsedReAct:
     """LLM 输出解析结果"""
