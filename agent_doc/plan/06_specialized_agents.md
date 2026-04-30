@@ -57,7 +57,10 @@ class CodeAgent(BaseAgent):
                  agent_config: AgentConfig | None = None) -> None:
         # CodeAgent 默认使用较低温度以提高代码质量
         if agent_config is None:
-            agent_config = AgentConfig(llm_temperature_override=0.3)
+            agent_config = AgentConfig(
+                llm_temperature_override=0.3,
+                max_iterations=15
+            )
         super().__init__(name=self.name, description=self.description,
                         config=config, agent_config=agent_config)
 ```
