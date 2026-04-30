@@ -220,6 +220,7 @@ FUNCTION ConnectionHealthCheck(server, config):
 FUNCTION ConfigureProtocol(session, profile: ProtocolProfile):
     // 通过预设Profile或逐参数自定义来配置协议行为
     // 推荐使用FromProfile工厂方法获取预设 → 再按需覆盖个别字段
+    // 可选协议引擎: KCP (kEngineKCP, 默认) / QUIC (kEngineQUIC)
 
     // 预定义Profile示例:
     //   kFastMode:     nodelay=1, interval=10, resend=2, fc=false
@@ -229,6 +230,7 @@ FUNCTION ConfigureProtocol(session, profile: ProtocolProfile):
 
     config = Session::Config::FromProfile(profile)
     // 在预设基础上微调 (可选):
+    config.engine_type = EngineType::kEngineQUIC  // 切换为QUIC协议引擎
     config.mtu_bytes = 1200  // 覆盖MTU以适配特定链路
     session.ApplyConfig(config)
 ```
@@ -263,7 +265,7 @@ FUNCTION ConfigureProtocol(session, profile: ProtocolProfile):
    └──────────┘  └──────────────┘  └──────────────┘
 
    关键扩展点:
-   1. Protocol Engine  — 实现统一接口即可替换为任意可靠传输协议
+   1. Protocol Engine  — 实现统一接口即可替换为任意可靠传输协议 (内置KCP和QUIC两种实现)
    2. DatagramSocket   — 适配UDPLite/RAW Socket/模拟测试层
    3. TaskQueue        — 可替换为无锁MPSC队列/优先级队列/有界队列
    4. TimerService     — 可替换为高精度定时器/分层时间轮
@@ -317,6 +319,7 @@ FUNCTION MultiThreadWorkerModel(num_workers):
 
 STRUCT LibraryConfig:        // 库级全局配置
     .io_backend               // kAutoDetect / kEpoll(Linux/Android) / kIocp(Windows) / kKqueue(macOS/BSD/iOS) / kPoll(回退)
+    .default_engine_type       // EngineType                默认协议引擎 (kEngineKCP / kEngineQUIC)
     .allocator                // 可替换内存分配器
     .log_sink                 // 日志输出目标
     .metrics_sink             // 指标输出目标 (Prometheus/自定义)
@@ -339,6 +342,7 @@ STRUCT ClientConfig:          // 客户端配置
     .local_bind_address       // DatagramSocket::Address  本地绑定地址
 
 STRUCT Session::Config:       // 会话级协议配置
+    .engine_type              // EngineType               协议引擎选择 (kEngineKCP / kEngineQUIC)
     .profile                  // ProtocolProfile          预设选择
     // --- 仅kCustom模式逐项生效,否则由FromProfile填充 ---
     .nodelay                  // int                      快速模式开关

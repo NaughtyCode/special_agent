@@ -127,7 +127,7 @@ CLASS Server:
             auto& result = recv_result.value().value()
 
             // 解析协议头部获取会话标识 (routing_key)
-            // conv是KCP的概念,泛化为routing_key以支持其他协议
+            // conv是KCP的概念,QUIC使用Connection ID,泛化为routing_key以支持多协议
             routing_key = ExtractRoutingKey(result.data, result.len)
             IF NOT routing_key.has_value():
                 CONTINUE   // 无效数据包 (长度不足),静默丢弃
@@ -250,11 +250,13 @@ CLASS Server:
                 )
         )
 
-    // 从数据报头部提取路由键 (协议相关,此处以KCP conv为例)
+    // 从数据报头部提取路由键 (协议相关,取决于协议引擎类型)
     PRIVATE FUNCTION ExtractRoutingKey(
             data: const uint8_t*, len: size_t
     ) -> std::optional<uint32_t>:
-        // KCP: conv 位于偏移0, 4字节大端无符号整数
+        // KCP:  conv 位于偏移0, 4字节大端无符号整数
+        // QUIC: Connection ID 位于偏移0 (长头) 或 偏移1 (短头),长度可变(0-20字节)
+        //       取后4字节哈希或使用SCID作为路由键
         // 其他协议可能有不同偏移或更复杂的提取逻辑 (如SIP的Call-ID哈希)
         IF len < 4: RETURN std::nullopt
         RETURN ReadBigEndianU32(data, 0)
@@ -357,8 +359,10 @@ FUNCTION EvictionPolicyComparison(session, policy: EvictionPolicy):
 // --------------------------------------------------
 FUNCTION SendProbe(session: std::shared_ptr<Session>):
     // 向空闲Session发送协议层探活包
-    // 协议引擎将构建并发送探活数据包 (如KCP的WASK命令字)
-    // 对端协议引擎收到后自动回复 (如WINS),完成一次心跳往返
+    // 协议引擎将构建并发送探活数据包:
+    //   KCP:  WASK命令字,对端自动回复WINS
+    //   QUIC: PING帧,对端自动回复PONG或携带数据的ACK
+    // 完成一次心跳往返,本端在后续FeedInput中会更新last_recv_time_ms_
     // 本端在后续FeedInput中会更新last_recv_time_ms_
     session->SendProbePacket()
 
