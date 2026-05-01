@@ -26,10 +26,10 @@
 │  ┌────┴──────────────┴──────────────┴────┐            │
 │  │              BaseAgent                 │            │
 │  │  ┌──────────┐ ┌──────────┐ ┌───────┐ │            │
-│  │  │ ReAct     │ │ Tool     │ │Context│ │            │
-│  │  │ Engine    │ │ Manager  │ │Store  │ │            │
-│  │  │ Crew      │ │ Agent    │ │ Agent  │ │            │
-│  │  │Orchestrator│ │Registry  │ │ Pool   │ │            │
+│  │  │ ReAct          │ │ Tool         │ │Context    │ │            │
+│  │  │ Engine         │ │ Manager      │ │Store      │ │            │
+│  │  │ Crew           │ │ Agent        │ │ Agent     │ │            │
+│  │  │ Orchestrator   │ │ Registry     │ │ Pool      │ │            │
 │  │  └──────────┘ └──────────┘ └───────┘ │            │
 │  └────────────────────┬──────────────────┘            │
 ├───────────────────────┼───────────────────────────────┤

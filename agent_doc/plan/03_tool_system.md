@@ -497,6 +497,19 @@ class ExecutionStrategy(Enum):
     PARALLEL = "parallel"
     DAG = "dag"
 
+# ── Crew 错误类型 ──────────────────────────────────
+
+class CrewInvalidStateError(Exception):
+    """
+    Crew 状态不合法错误 — 当 execute_crew() 被调用时 crew.status != "ASSEMBLED" 时抛出。
+
+    典型场景:
+    - 重复执行同一个 AgentCrew 实例 (Crew 是一次性的, 不可复用)
+    - 尝试执行尚未完成规划的 Crew
+    - 手动修改了 crew.status 为非预期值
+    """
+    pass
+
 # ── CrewOrchestrator ──────────────────────────────
 
 class CrewOrchestrator:
@@ -557,9 +570,13 @@ class CrewOrchestrator:
            输出结构化子任务列表 (JSON)
         3. 每个子任务通过 AgentRegistry.match_agent() 匹配最佳 Agent
         4. 构建 AgentCrew (含 CrewMember 列表)
-        5. 发布 CrewLifecycleEvent.PLANNED (携带 CrewEvent 负载)
+        5. 设置 crew.created_at = time.time() (记录创建时间戳, 用于计算总耗时)
+        6. 发布 CrewLifecycleEvent.PLANNED (携带 CrewEvent 负载)
 
         返回已组建但尚未执行的 AgentCrew (status=ASSEMBLED)。
+
+        若 available_agents 为 None, 则默认从 self.agent_registry.list_agents()
+        获取全部已注册 Agent 的元数据, 确保任务分解时 LLM 了解所有可用的 Agent 能力。
         """
 
     # ── Execute: Crew 执行 ────────────────────────────
@@ -570,15 +587,21 @@ class CrewOrchestrator:
         """
         按指定策略执行 Crew。
 
+        前置条件: crew.status 必须为 ASSEMBLED, 否则抛出 CrewInvalidStateError
+        (防止重复执行同一 Crew 或执行未完成规划的 Crew)。
+
         内部流程:
-        1. 发布 CrewLifecycleEvent.STARTED (携带 CrewEvent 负载, 含 crew_id 和 strategy)
-        2. 根据 strategy 分发到 _execute_sequential / _execute_parallel / _execute_dag
-        3. 每个成员执行: AgentPool.acquire → agent.run(task) → AgentPool.release
+        1. 校验 crew.status == "ASSEMBLED", 不满足则抛出 CrewInvalidStateError
+        2. 设置 crew.status = "RUNNING"
+        3. 发布 CrewLifecycleEvent.STARTED (携带 CrewEvent 负载, 含 crew_id 和 strategy)
+        4. 根据 strategy 分发到 _execute_sequential / _execute_parallel / _execute_dag
+        5. 每个成员执行: AgentPool.acquire → agent.run(task) → AgentPool.release
            (每个成员执行时发布 MEMBER_STARTED / MEMBER_COMPLETED / MEMBER_FAILED,
             各携带 CrewEvent 负载含 crew_id, member_name, task_id)
-        4. 汇总所有成员结果 → 调用 _aggregate_results
-        5. 发布 CrewLifecycleEvent.COMPLETED 或 FAILED (携带 CrewEvent 负载)
-        6. 返回 CrewResult
+        6. 汇总所有成员结果 → 调用 _aggregate_results
+        7. 设置 crew.status = "COMPLETED" (全部成功) 或 "FAILED" (有失败成员)
+        8. 发布 CrewLifecycleEvent.COMPLETED 或 FAILED (携带 CrewEvent 负载)
+        9. 返回 CrewResult
         """
 
     def _execute_sequential(self, crew: AgentCrew) -> list[tuple[str, AgentResult]]:
@@ -625,12 +648,19 @@ class CrewOrchestrator:
                            results: list[tuple[str, AgentResult]]) -> CrewResult:
         """
         汇总所有成员结果:
-        1. 将所有 member final_answer 拼接为上下文 (失败成员标注其错误)
-        2. 调用 LLM 生成统一的 mission_summary
+        1. 遍历 results, 将每个 (agent_name, AgentResult) 拆分:
+           - 若 AgentResult.success == True → 提取 final_answer
+           - 若 AgentResult.success == False → 记录到 failed_members 列表,
+             提取 error 信息作为上下文
+        2. 将所有 member final_answer 和失败信息拼接为上下文
+        3. 调用 LLM 生成统一的 mission_summary
            (使用默认 temperature, 非 plan_temperature, 因为聚合任务是总结性工作)
-        3. 计算 total_duration_ms 和 total token_usage
-        4. 判定整体 success (全部成员 success=True 且无异常),
-           收集 failed_members 列表
+        4. 计算 total_duration_ms (sum of all member durations) 和
+           total token_usage (sum of all member token_usage)
+        5. 判定整体 success:
+           - True: failed_members 为空 (全部成员 success=True 且无异常)
+           - False: failed_members 非空, mission_summary 包含已完成部分 + 失败说明
+        6. 构建并返回 CrewResult (含 failed_members 列表)
         """
 ```
 

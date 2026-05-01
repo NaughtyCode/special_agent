@@ -47,11 +47,16 @@ class CodeAgent(BaseAgent):
 9. 若不确定需求, 主动向用户确认而非猜测"""
 
     def register_tools(self) -> None:
+        # ── 基础 Tool ──
         self.tool_manager.register(ReadFileTool())
         self.tool_manager.register(WriteFileTool())
         self.tool_manager.register(SearchCodeTool())
         self.tool_manager.register(RunShellTool(requires_confirmation=True))
         self.tool_manager.register(ListFilesTool())
+        # ── Crew 编排 Tool ──
+        # 注册 CrewTool 使此 Agent 可通过 Function Calling 发起 Crew 编排,
+        # 成为 CrewLeader 动态组建 Agent 团队完成复杂任务。
+        self.tool_manager.register(CrewTool(agent=self))
 
     # 可选: 覆盖默认配置
     def __init__(self, config: Config | None = None,
@@ -95,11 +100,16 @@ class DocAgent(BaseAgent):
 7. 使用 Mermaid 语法绘制架构图/流程图 (如适用)"""
 
     def register_tools(self) -> None:
+        # ── 基础 Tool ──
         self.tool_manager.register(ReadFileTool())
         self.tool_manager.register(WriteFileTool())
         self.tool_manager.register(SearchCodeTool())
         self.tool_manager.register(ListFilesTool())
         self.tool_manager.register(WebSearchTool())  # 用于查找外部参考
+        # ── Crew 编排 Tool ──
+        # 注册 CrewTool 使此 Agent 可通过 Function Calling 发起 Crew 编排,
+        # 成为 CrewLeader 动态组建 Agent 团队完成复杂任务。
+        self.tool_manager.register(CrewTool(agent=self))
 
     def __init__(self, config: Config | None = None,
                  agent_config: AgentConfig | None = None) -> None:
@@ -140,11 +150,16 @@ class SearchAgent(BaseAgent):
 5. 对于模糊的搜索需求, 先确认搜索范围再执行"""
 
     def register_tools(self) -> None:
+        # ── 基础 Tool ──
         self.tool_manager.register(SearchCodeTool())
         self.tool_manager.register(WebSearchTool())
         self.tool_manager.register(WebFetchTool())
         self.tool_manager.register(ReadFileTool())
         self.tool_manager.register(ListFilesTool())
+        # ── Crew 编排 Tool ──
+        # 注册 CrewTool 使此 Agent 可通过 Function Calling 发起 Crew 编排,
+        # 成为 CrewLeader 动态组建 Agent 团队完成复杂任务。
+        self.tool_manager.register(CrewTool(agent=self))
 
     def __init__(self, config: Config | None = None,
                  agent_config: AgentConfig | None = None) -> None:
@@ -187,10 +202,15 @@ class ShellAgent(BaseAgent):
 7. 命令输出过长时, 使用截断并提示完整输出位置"""
 
     def register_tools(self) -> None:
+        # ── 基础 Tool ──
         self.tool_manager.register(RunShellTool(requires_confirmation=True))
         self.tool_manager.register(ReadFileTool())
         self.tool_manager.register(WriteFileTool())
         self.tool_manager.register(ListFilesTool())
+        # ── Crew 编排 Tool ──
+        # 注册 CrewTool 使此 Agent 可通过 Function Calling 发起 Crew 编排,
+        # 成为 CrewLeader 动态组建 Agent 团队完成复杂任务。
+        self.tool_manager.register(CrewTool(agent=self))
 
     def __init__(self, config: Config | None = None,
                  agent_config: AgentConfig | None = None) -> None:
@@ -290,6 +310,9 @@ RootAgent
 ```
 
 ### 5.5 Crew 编排 (Crew Orchestration)
+
+以下以 CodeAgent 作为 CrewLeader 为例 — 任何已注册 CrewTool 的特化 Agent 均可担任此角色。
+
 ```
 CodeAgent (CrewLeader)
    │
@@ -321,28 +344,18 @@ CodeAgent (CrewLeader)
 
 任何特化 Agent 均可通过继承自 BaseAgent 的 `form_crew()` 和 `launch_crew()` 方法成为 **CrewLeader**，无需额外覆写。
 
+所有内置 Agent (§3.1-§3.4) 已在 `register_tools()` 中注册了 `CrewTool(agent=self)`,
+因此均可通过 Function Calling 发起 Crew 编排, 开箱即用地充当 CrewLeader。
+
 ```python
 # 示例: CodeAgent 在 ReAct 循环中拉起 Crew 完成复杂需求
 #
 # 当用户输入 "帮我实现一个用户认证系统" 时,
 # CodeAgent 的 LLM 识别到任务需多领域协作 (代码 + 文档 + 测试),
-# 通过 Function Calling 调用 launch_crew:
-
-# CodeAgent 在 register_tools() 中额外注册 CrewTool,
-# 使其 LLM 可通过 Function Calling 发起 Crew 编排。
-# (以下为 §3.1 中 register_tools() 的扩展版本, 新增最后一行)
-def register_tools(self) -> None:
-    # ── 基础 Tool (与 §3.1 相同) ──
-    self.tool_manager.register(ReadFileTool())
-    self.tool_manager.register(WriteFileTool())
-    self.tool_manager.register(SearchCodeTool())
-    self.tool_manager.register(RunShellTool(requires_confirmation=True))
-    self.tool_manager.register(ListFilesTool())
-    # ── Crew 编排 Tool (新增) ──
-    self.tool_manager.register(CrewTool(agent=self))
+# 通过已注册的 CrewTool (即 launch_crew Tool) 发起 Crew 编排:
 
 # CrewTool 将 launch_crew() 包装为 Tool,
-# 使 LLM 可通过 Function Calling 发起 Crew 编排:
+# LLM 通过 Function Calling 自动调用 (无需额外配置):
 # {
 #     "name": "launch_crew",
 #     "arguments": {

@@ -5,8 +5,8 @@
 | 项目 | 内容 |
 |------|------|
 | 修改编号 | issue7 |
-| 修改日期 | 2026-04-30 |
-| 修改类型 | Crew 机制深度审查 (两轮) — 补全缺失定义、修复跨文档不一致、增强注释与错误处理 |
+| 修改日期 | 2026-05-01 |
+| 修改类型 | Crew 机制深度审查 (三轮) — 补全缺失定义、修复跨文档不一致、增强注释与错误处理、修复生命周期管理缺失 |
 | 关联文档 | `agent_doc/plan/` (00, 01, 03, 06, 07, 08) |
 | 修改人 | SpecialArchAgent |
 
@@ -240,4 +240,170 @@ crew_plan_temperature: float = 0.4      # (CREW_PLAN_TEMPERATURE)
 |------|--------|----------|
 | 第一轮 | 9 | 缺失定义、参数错误、类型错误、重复逻辑、依赖遗漏、拼写 |
 | 第二轮 | 8 | 依赖遗漏、文档结构、跨文档不一致、缺失结构、异常处理、语义不清、注释 |
-| **合计** | **17** | |
+| **合计 (前两轮)** | **17** | |
+
+---
+
+## 第三轮深度审查 (追加修复)
+
+在对 Crew 机制进行第三次反复检查后，发现以下额外问题并修复。本轮重点关注跨文档一致性、生命周期状态管理缺失、以及特化 Agent 与 Crew 编排机制的集成完整性问题。
+
+### 追加文件变更清单
+
+| 序号 | 文件路径 | 变更说明 |
+|------|----------|----------|
+| C1 | `agent_doc/plan/00_architecture_overview.md` | §3 ASCII 架构图修复组件名称对齐 (Crew/Orchestrator 分离 → 统一对齐) |
+| C2 | `agent_doc/plan/01_base_agent.md` | form_crew() 传递 available_agents 参数到 plan_crew(); launch_crew() 补充 AgentCrew 一次性语义说明 |
+| C3 | `agent_doc/plan/03_tool_system.md` | plan_crew() 新增 available_agents=None 回退逻辑文档 + created_at 初始化; execute_crew() 新增 crew 状态校验 (ASSEMBLED 前置条件) + 生命周期状态转换 (RUNNING→COMPLETED/FAILED); _aggregate_results() 补充 failed_members 构建流程; 新增 CrewInvalidStateError 错误类型 |
+| C4 | `agent_doc/plan/06_specialized_agents.md` | 全部 4 个内置 Agent (CodeAgent/DocAgent/SearchAgent/ShellAgent) 的 register_tools() 新增 CrewTool 注册 + 注释; §5.5 补充 "任何 Agent 均可担任 CrewLeader" 说明; §6 移除与 §3.1 冲突的扩展版 register_tools(), 改为引用主定义 |
+| C5 | `agent_doc/plan/08_implementation_roadmap.md` | 任务 2.6a (CrewOrchestrator) 依赖补全 2.1 (数据模型); 依赖关系图同步更新 |
+
+### 追加问题详情
+
+#### 问题 16: 00 架构图 ASCII 组件名称对齐错误
+
+**发现**: `00_architecture_overview.md` §3 的架构分层 ASCII 图中, BaseAgent 内部组件框的行内文本对齐不一致 — `Orchestrator` 和 `Registry` 及 `Pool` 的首字符顶着内框左边界, 而上一行 `Crew`、`Agent`、`Agent` 后有大量空格, 导致组件名称在视觉上被"撕裂"成两半:
+```
+│  │  │ Crew      │ │ Agent    │ │ Agent  │ │
+│  │  │Orchestrator│ │Registry  │ │ Pool   │ │
+```
+正确的做法是将所有组件名称在框内右对齐/居中对齐, 使名称不被换行割裂。
+
+**修复**: 调整每行空格, 使组件名称在各自框内左对齐一致:
+```
+│  │  │ Crew           │ │ Agent        │ │ Agent     │ │
+│  │  │ Orchestrator   │ │ Registry     │ │ Pool      │ │
+```
+
+#### 问题 17: form_crew() 不传递 available_agents
+
+**发现**: `01_base_agent.md` 中 `BaseAgent.form_crew()` 调用 `crew_orchestrator.plan_crew(mission, lead_agent_name=self.name)`, 但 `plan_crew()` 的 `available_agents` 参数被忽略。当调用方未传递 `available_agents` 时, plan_crew() 的行为 (从 agent_registry 获取全部 Agent 列表作为默认值) 未在文档中说明, 实现者需要猜测。
+
+**修复**: 
+- `form_crew()` 文档更新, 显式传递 `available_agents=self.agent_registry.list_agents()`
+- `plan_crew()` 文档补充: "若 available_agents 为 None, 则默认从 self.agent_registry.list_agents() 获取全部已注册 Agent"
+
+#### 问题 18: Crew 生命周期状态管理缺失
+
+**发现**: `03_tool_system.md` 的 `CrewOrchestrator` 存在以下生命周期管理缺陷:
+
+a) **created_at 未初始化**: `AgentCrew.created_at` 默认为 0.0, 但 `plan_crew()` 文档中未说明何时设置此时间戳, 导致 `total_duration_ms` 计算可能错误。
+
+b) **execute_crew() 无状态校验**: `execute_crew()` 未校验 `crew.status`, 可能导致重复执行同一 Crew 实例或执行未完成规划的 Crew。AgentCrew 设计为一次性使用 (ASSEMBLED → RUNNING → COMPLETED/FAILED), 但缺乏执行前状态检查的防护。
+
+c) **execute_crew() 无状态转换**: `execute_crew()` 文档未说明在执行开始/结束时更新 crew.status, 导致 AgentCrew 实例在执行后仍显示为 ASSEMBLED, 违反其生命周期设计。
+
+d) **missing error type**: 缺少 `CrewInvalidStateError` 错误类型来表示非法的 Crew 状态操作。
+
+**修复**:
+- `plan_crew()` 新增步骤 5: 设置 `crew.created_at = time.time()`
+- `execute_crew()` 新增:
+  - 前置条件校验: crew.status 必须为 ASSEMBLED, 否则抛出 `CrewInvalidStateError`
+  - 执行开始: 设置 `crew.status = "RUNNING"`
+  - 执行完成: 设置 `crew.status = "COMPLETED"` 或 `"FAILED"`
+- 新增 `CrewInvalidStateError(Exception)` 类定义, 说明典型触发场景
+
+#### 问题 19: _aggregate_results() 缺少 failed_members 构建逻辑
+
+**发现**: `CrewResult` 在第 A1 轮中新增了 `failed_members: list[str]` 字段, 但 `_aggregate_results()` 方法文档仅用文字描述"收集 failed_members 列表", 未给出具体的遍历判定和填充步骤, 实现者不清楚:
+- 以什么条件判定成员失败 (AgentResult.success == False + AgentResult.error != None)
+- 失败成员的 AgentResult 是否仍参与 mission_summary 汇总
+- failed_members 列表与 member_results 列表的关系
+
+**修复**: `_aggregate_results()` 文档扩展为 6 步详细流程:
+1. 遍历 results 拆分成功/失败成员
+2. 失败成员记录到 failed_members, 提取 error 作为上下文
+3. 拼接所有结果 (含失败信息) 为 LLM 汇总上下文
+4. LLM 生成 mission_summary
+5. 计算 total_duration_ms 和 total_token_usage
+6. 判定 success: failed_members 为空则 True, 非空则 False
+
+#### 问题 20: 所有内置 Agent 缺少 CrewTool 注册
+
+**发现**: `06_specialized_agents.md` §3.1-§3.4 的 4 个内置特化 Agent (CodeAgent/DocAgent/SearchAgent/ShellAgent) 在 `register_tools()` 中均未注册 `CrewTool(agent=self)`。
+
+核心矛盾: 框架设计明确声明 **"任何特化 Agent 均可成为 CrewLeader"** (见 00_architecture_overview.md §2, 01_base_agent.md crew_orchestrator 属性注释, 06_specialized_agents.md §2 设计原则), 但没有内置 Agent 注册了 CrewTool。这意味着:
+
+- 所有内置 Agent 无法通过 Function Calling 发起 Crew 编排 — LLM 在 ReAct 循环中看不到 `launch_crew` Tool
+- 虽然 `BaseAgent` 提供了 `form_crew()` / `launch_crew()` 方法可供编程调用, 但 LLM 驱动的自主 Crew 组建能力完全缺失
+- 用户必须手动在每个 Agent 子类中注册 CrewTool 才能启用此核心能力, 违背"开箱即用"的设计意图
+
+**修复**:
+- CodeAgent/CodeAgent/DocAgent/SearchAgent/ShellAgent 的 `register_tools()` 方法均添加:
+  ```python
+  # ── Crew 编排 Tool ──
+  # 注册 CrewTool 使此 Agent 可通过 Function Calling 发起 Crew 编排,
+  # 成为 CrewLeader 动态组建 Agent 团队完成复杂任务。
+  self.tool_manager.register(CrewTool(agent=self))
+  ```
+- 添加注释说明注册意图
+
+#### 问题 21: §6 Crew 示例 register_tools() 与主定义代码冲突
+
+**发现**: 在问题 20 修复前, `06_specialized_agents.md` 存在两处 `register_tools()` 定义:
+- §3.1 (主定义): 注册 5 个基础 Tool, 不含 CrewTool
+- §6 (示例): 注册 5 个基础 Tool + CrewTool, 标注为 "扩展版本"
+
+问题 20 修复后, 主定义已包含 CrewTool, §6 的 "扩展版本" 标注反而会产生误导 — 建议用户额外扩展一个已有功能。
+
+**修复**: §6 移除重复的 `register_tools()` 代码块, 改为说明:
+"所有内置 Agent 已在 register_tools() 中注册了 CrewTool(agent=self), 因此均可通过 Function Calling 发起 Crew 编排, 开箱即用地充当 CrewLeader。"
+
+#### 问题 22: 08 路线图 CrewOrchestrator 缺少数据模型依赖
+
+**发现**: `08_implementation_roadmap.md` 任务 2.6a (CrewOrchestrator) 的依赖列为 `1.4, 1.7, 2.6`, 但 `CrewOrchestrator` 的实现需要以下数据模型:
+- `SubTask`, `CrewMember`, `AgentCrew`, `CrewResult`, `CrewEvent` (定义在 2.1 数据模型任务中)
+- `ExecutionStrategy` (定义在 2.1 或 CrewOrchestrator 自身中)
+
+虽然部分数据模型可能随 CrewOrchestrator 一起实现, 但 `AgentCrew`/`CrewResult` 被 `BaseAgent` (2.10) 引用, `CrewEvent` 被 `EventBus` (1.4) 引用, 因此这些共享数据模型应归入 2.1 任务提前定义。
+
+**修复**: 任务 2.6a 依赖更新为 `1.4, 1.7, 2.1, 2.6`; 依赖关系图同步更新。
+
+#### 问题 23: launch_crew() 未说明重复执行行为
+
+**发现**: `BaseAgent.launch_crew()` 文档未说明:
+- 每次调用是否创建全新的 AgentCrew (通过 form_crew)
+- AgentCrew 是否可重复执行
+- 若用户先调用 form_crew() 再手动调用 execute_crew(), 再调用 launch_crew() 会发生什么
+
+这导致实现者和使用者对 Crew 的复用语义存在歧义。
+
+**修复**: `launch_crew()` 文档新增注意事项:
+"此方法每次调用都会通过 form_crew() 创建全新的 AgentCrew, 不会复用之前的 Crew。AgentCrew 是一次性的 (执行后状态变为 COMPLETED/FAILED, 不可重复执行)。"
+
+#### 问题 24: §5.5 示例未说明 CodeAgent 非特例
+
+**发现**: `06_specialized_agents.md` §5.5 "Crew 编排" 直接以 "CodeAgent (CrewLeader)" 作为示例, 但缺乏说明: 此示例以 CodeAgent 为代表, 任何特化 Agent 均可担任此角色。
+
+新读者可能误以为只有 CodeAgent 能做 CrewLeader。
+
+**修复**: 在流程图前新增一行说明:
+"以下以 CodeAgent 作为 CrewLeader 为例 — 任何已注册 CrewTool 的特化 Agent 均可担任此角色。"
+
+### 第三轮问题修复统计
+
+| 类别 | 数量 | 说明 |
+|------|------|------|
+| 生命周期管理缺失 | 4 | created_at 未初始化, execute_crew() 无状态校验/转换, 缺 CrewInvalidStateError |
+| 方法实现不完整 | 2 | _aggregate_results() 缺 failed_members 构建逻辑, form_crew() 缺 available_agents 传递 |
+| 功能集成缺失 | 1 | 全部 4 个内置 Agent 缺 CrewTool 注册 (核心能力无法启用) |
+| 文档冲突/不一致 | 2 | §6 register_tools() 与 §3.1 冲突, §5.5 未说明 CrewLeader 普适性 |
+| 依赖关系遗漏 | 1 | 08 路线图 2.6a 缺 2.1 数据模型依赖 |
+| 语义不明 | 2 | launch_crew() 未说明一次性语义, ASCII 图组件名撕裂 |
+| **第三轮合计** | **11** | (问题 18 合并 4 个子问题) |
+
+### 三轮累计修复统计
+
+| 轮次 | 问题数 | 主要类型 |
+|------|--------|----------|
+| 第一轮 | 9 | 缺失定义、参数错误、类型错误、重复逻辑、依赖遗漏、拼写 |
+| 第二轮 | 8 | 依赖遗漏、文档结构、跨文档不一致、缺失结构、异常处理、语义不清、注释 |
+| 第三轮 | 11 | 生命周期管理缺失、功能集成缺失、文档冲突、参数传递、依赖遗漏、语义不明 |
+| **总计** | **28** | |
+
+### 第三轮影响分析
+
+- **核心能力可用性**: 问题 20 的修复使所有内置 Agent 开箱即用地支持 Crew 编排, 无需用户手动配置。这是确保 "任何 Agent 均可成为 CrewLeader" 设计承诺的关键修复。
+- **Crew 生命周期完整性**: 问题 18 (a-d) 的修复确保了 AgentCrew 的状态机正确运转, 防止了重复执行、时间戳未初始化等可能导致数据错误或资源泄漏的问题。
+- **文档一致性**: 问题 21/24 消除了代码示例与主定义之间的冲突, 避免实现者引用冲突信息。
+- **依赖正确性**: 问题 22 确保了路线图中的构建顺序与实际代码依赖一致, 避免实现阶段的顺序错误。
