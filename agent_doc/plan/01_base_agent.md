@@ -174,12 +174,15 @@ class BaseAgent(ABC):
 
         调用 crew_orchestrator.plan_crew(
             mission, lead_agent_name=self.name,
-            available_agents=self.agent_registry.list_agents()
+            available_agents=self.agent_registry.list_agents(),
+            crew_leader_call_depth=self.config.call_depth
         ):
         1. LLM 分析 mission, 分解为 SubTask 列表
            (LLM 可参考 available_agents 中每个 Agent 的能力描述进行分解)
         2. 每个 SubTask 通过 AgentRegistry 匹配最佳特化 Agent
-        3. 构建并返回 AgentCrew (status=ASSEMBLED, created_at 已设置)
+        3. 构建并返回 AgentCrew (status=ASSEMBLED, created_at 已设置,
+           crew_leader_call_depth 已记录,
+           供 execute_crew 为成员构建 AgentConfig 时计算 call_depth + 1)
 
         返回的 AgentCrew 可调用 launch_crew() 执行,
         或先检查/手动调整成员再执行。
@@ -208,6 +211,16 @@ class BaseAgent(ABC):
         注意: 此方法每次调用都会通过 form_crew() 创建全新的 AgentCrew,
         不会复用之前的 Crew。AgentCrew 是一次性的 (执行后状态变为 COMPLETED/FAILED,
         不可重复执行)。
+
+        递归风险: Crew 成员 Agent 若也注册了 CrewTool, 其 LLM 可能在子任务中
+        再次调用 launch_crew, 形成 Crew 嵌套。防护措施:
+        - launch_crew 入口处检查 self.config.call_depth >= Config.agent_max_call_depth,
+          超限则抛出 AgentDepthExceededError
+        - form_crew() 将 self.config.call_depth 作为 crew_leader_call_depth 传入
+          plan_crew() 并存储到 AgentCrew 上
+        - execute_crew() 在 agent_factory 中为每个 CrewMember 构建 AgentConfig 时,
+          设置 call_depth = crew.crew_leader_call_depth + 1,
+          使深度限制向下传播, 与 launch_agent() 的保护机制一致
         """
 
     # ── LLM 操作 ──────────────────────────────────────

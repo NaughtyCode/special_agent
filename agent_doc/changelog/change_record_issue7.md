@@ -6,13 +6,13 @@
 |------|------|
 | 修改编号 | issue7 |
 | 修改日期 | 2026-05-01 |
-| 修改类型 | Crew 机制深度审查 (七轮) — 补全缺失定义、修复跨文档不一致、增强注释与错误处理、修复生命周期管理缺失、修复类型不一致与执行细节缺失、修复运行时逻辑错误与资源管理缺陷、修复类型系统歧义与流程图逻辑错误、修复代码示例错误与边界条件校验缺失 |
+| 修改类型 | Crew 机制深度审查 (九轮) — 补全缺失定义、修复跨文档不一致、增强注释与错误处理、修复生命周期管理缺失、修复类型不一致与执行细节缺失、修复运行时逻辑错误与资源管理缺陷、修复类型系统歧义与流程图逻辑错误、修复代码示例错误与边界条件校验缺失、修复计时字段与时序计算错误、修复 falsy 值判空 Bug 与深度传播缺失 |
 | 关联文档 | `agent_doc/plan/` (00, 01, 03, 06, 07, 08) |
 | 修改人 | SpecialArchAgent |
 
 ## 修改概述
 
-对 Issue #6 新增的 Crew 团队编排机制进行七轮反复深度审查。
+对 Issue #6 新增的 Crew 团队编排机制进行九轮反复深度审查。
 
 **第一轮**: 修复缺失的类定义、配置字段缺失、方法参数传递错误、事件定义格式错误、事件发布重复、依赖关系遗漏等问题。
 
@@ -27,6 +27,10 @@
 **第六轮**: 修复类型系统歧义 (member_results/failed_members 使用非唯一 agent_name 而非 task_id)、编排流程图逻辑错误 (form_crew + launch_crew 冗余调用)、DAG 循环依赖检测缺失、max_parallel 回退逻辑未文档化、CrewEvent 类型不精确、launch_crew 参数覆写解析顺序缺失等问题。
 
 **第七轮**: 修复 execute_crew 代码示例变量名错误 (agent→member.agent_instance, task→member.task)、AgentPool factory 参数未文档化、CrewTool.execute() KeyError 未捕获、plan_crew 依赖引用校验缺失/Agent 匹配校验缺失、execute_crew 空成员列表未处理、DAG context 线程安全覆盖不全、task.context=None 时合并崩溃、AgentTool 与 CrewTool 错误处理不一致等问题。
+
+**第八轮**: 修复 AgentCrew 缺少 completed_at 字段、total_duration_ms 使用错误计算方式 (sum of member durations 不适用于并发执行)、plan_crew 未文档化 crew_id 生成、execute_crew 未记录 completed_at、CrewTool JSON Schema 缺少 default 值、_execute_dag 未传递 max_parallel 导致无并发上限、_aggregate_results LLM 聚合失败未处理、Crew 嵌套递归风险未文档化等问题。
+
+**第九轮**: 修复 max_parallel 参数使用 `or` 运算导致 0 值被错误回退、plan_crew 未文档化 SubTask UUID 生成与依赖重映射机制、agent_pool.acquire() 在 try 块外导致异常时成员静默丢失、total_duration_ms 可能因未设置 completed_at 产生负值、_execute_sequential 首个成员 context=None 行为未文档化、CrewResult 示例缺少 crew_id/total_duration_ms 字段、_execute_dag 波次模型并行槽位利用不足未说明、_execute_sequential 仅传递 final_answer 的简化设计未解释、agent_factory 未传播 call_depth 导致 Crew 嵌套深度保护失效、CrewOrchestrator 未存储 Config 引用等问题。
 
 ## 文件变更清单
 
@@ -834,7 +838,9 @@ member.completed_at = time.time()  # 在 finally 块中
 | 第五轮 | 11 | 运行时逻辑错误、线程安全、资源管理缺陷、配置缺失、数据模型缺失、文档精确性 |
 | 第六轮 | 11 | 类型歧义、流程图逻辑错误、边界条件缺失、文档缺口、示例同步 |
 | 第七轮 | 10 | 代码示例错误、边界校验缺失、线程安全覆盖不全、错误处理不一致 |
-| **总计** | **69** | |
+| 第八轮 | 10 | 计时字段缺失、duration 计算错误、并发上限缺失、LLM 容错缺失、递归风险 |
+| 第九轮 | 9 | Python 语义陷阱、UUID 生成规范缺口、异常传播缺陷、深度传播缺失 |
+| **总计** | **88** | |
 
 ### 第六轮影响分析
 
@@ -958,3 +964,213 @@ AgentResult(success=False, final_answer=str(e),
 - **异常鲁棒性**: 问题 59/65 确保所有 Tool 执行路径的错误处理一致 — 无论是单个 Agent 拉起还是 Crew 编排, 异常都被捕获并优雅降级, 而非中断 ReAct 循环。
 - **边界完备性**: 问题 60-62 补全了 plan→execute 链路上的 3 个关键校验点 (依赖完整性/匹配有效性/成员非空), 确保非法状态在最早的阶段被检测和拒绝。
 - **并发安全**: 问题 64 将 context 字段纳入线程安全保护范围, 防止 DAG 并发执行时出现数据竞争导致的结果损坏。
+
+---
+
+## 第八轮深度审查 (补充修复)
+
+在对 Crew 机制进行第八次反复检查后，发现以下额外问题。本轮重点关注时序计算的正确性、并发控制参数的完整性、以及异常场景下的容错机制。
+
+### 追加文件变更清单
+
+| 序号 | 文件路径 | 变更说明 |
+|------|----------|----------|
+| H1 | `agent_doc/plan/03_tool_system.md` | AgentCrew 新增 completed_at 字段; plan_crew 步骤 5 合并 created_at/crew_id 生成; execute_crew 新增 completed_at 设置步骤并进行步骤重编号; _aggregate_results 步骤 4 从 sum-of-member-durations 改为 crew.completed_at - crew.created_at wall-clock 计算; _execute_dag 新增 max_parallel 参数 (与 _execute_parallel 一致) + 就绪队列并发限制文档; _aggregate_results 步骤 3 新增 LLM 聚合失败降级策略; CrewTool max_parallel JSON Schema 新增 "default": 4 |
+| H2 | `agent_doc/plan/01_base_agent.md` | launch_crew() 新增 Crew 嵌套递归风险文档与 call_depth 防护措施 |
+
+### 追加问题详情
+
+#### 问题 67: AgentCrew 缺少 completed_at 字段
+
+**发现**: `AgentCrew` 有 `created_at: float` 用于记录创建时间，但缺少对应的 `completed_at` 字段。若需计算 Crew 执行的 wall-clock 总耗时，必须依赖外部计时或从 member 时间戳推算，缺乏权威的单一时间源。
+
+**修复**: `AgentCrew` 新增 `completed_at: float = 0.0` 字段，由 `execute_crew()` 在所有成员执行完毕、调用 `_aggregate_results` 之前设置。
+
+#### 问题 68: total_duration_ms 使用错误的计算方式
+
+**发现**: `_aggregate_results` 步骤 4 原为 "计算 total_duration_ms (sum of all member durations)"。对 SEQUENTIAL 策略此计算近似正确，但对 PARALLEL 和 DAG 策略，将并发执行的成员耗时累加会严重高估实际耗时。例如 3 个成员并发执行各 10 秒，实际 wall-clock 时间约 10 秒，但 sum 为 30 秒。
+
+**修复**: 改为 wall-clock 计算: `total_duration_ms = (crew.completed_at - crew.created_at) * 1000`。各成员独立耗时可通过 `member_results` 中每个 `AgentResult.total_duration_ms` 获取。
+
+#### 问题 69: plan_crew 未文档化 crew_id 生成时机
+
+**发现**: `AgentCrew.crew_id` 注释为 "UUID v4"，但 `plan_crew()` 的 7 个步骤中均未提及何时生成此 UUID。实现者需自行推断生成时机。
+
+**修复**: `plan_crew()` 步骤 5 "构建 AgentCrew" 扩展为 3 个子步骤: 生成 crew_id (UUID v4) → 填充 CrewMember 列表 → 设置 created_at，合并了原有的 created_at 设置步骤。
+
+#### 问题 70: execute_crew 未设置 crew.completed_at
+
+**发现**: `execute_crew()` 负责整个 Crew 的执行生命周期，但从未记录执行完成的时间戳。缺少此时间戳导致两个问题: (1) 无法计算 wall-clock 总耗时; (2) Crew 生命周期不完整 (有始无终)。
+
+**修复**: `execute_crew()` 新增步骤 7: "设置 crew.completed_at = time.time()"，在所有成员执行完成后、调用 `_aggregate_results` 之前设置。后续步骤编号相应调整 (8→9, 9→10, 10→11)。
+
+#### 问题 71: CrewTool max_parallel JSON Schema 缺少 default 值
+
+**发现**: `CrewTool.parameters_schema` 中 `max_parallel` 字段仅通过 `description` 文本说明 "(默认 4)"，但 JSON Schema 规范使用 `"default"` 键声明默认值。LLM 和 API 客户端通常通过 `"default"` 键而非 description 文本识别默认值。
+
+**修复**: `max_parallel` 新增 `"default": 4`，与 description 独立。
+
+#### 问题 72: _execute_dag 未接收 max_parallel 参数
+
+**发现**: `execute_crew()` 向 `_execute_parallel` 传递了 `max_parallel`，但向 `_execute_dag` 未传递。DAG 就绪队列中的成员也需并发执行，无 `max_parallel` 限制意味着 ThreadPoolExecutor 可能创建与就绪队列大小相同的线程数，在最坏情况下等同于无限制。
+
+**修复**:
+- `_execute_dag` 签名新增 `max_parallel: int` 参数
+- `execute_crew()` DAG 分发逻辑更新为 `_execute_dag(crew, max_parallel or self.max_parallel)`
+- `_execute_dag` 步骤 4 明确 "使用 ThreadPoolExecutor(max_workers=max_parallel)"
+
+#### 问题 73: _aggregate_results LLM 聚合失败无降级处理
+
+**发现**: `_aggregate_results` 步骤 3 调用 LLM 生成 `mission_summary`。这是 Crew 执行的最后一步 — 所有成员已完成工作并产生结果。若此 LLM 调用因超时、限流等原因失败且无错误处理，整个 `_aggregate_results` 抛出异常，所有已完成成员的工作成果丢失。
+
+**修复**: 步骤 3 新增降级策略: "若 LLM 调用失败, 降级为人工拼接 — mission_summary = '\n\n'.join([f'[{agent_name}] {result.final_answer}' for ...]) — 确保所有已完成成员工作不会因聚合失败而丢失。"
+
+#### 问题 74: Crew 嵌套递归风险未文档化
+
+**发现**: `launch_agent()` 通过 `call_depth` 机制防止无限 Agent 嵌套。但 `launch_crew()` 无等效保护。若 Crew 成员 Agent 也注册了 `CrewTool`，其 LLM 可能在子任务中再次调用 `launch_crew`，形成无限制的 Crew 嵌套递归，最终耗尽系统资源。
+
+**修复**: `launch_crew()` 文档新增递归风险说明与防护措施:
+- 入口处检查 `call_depth >= agent_max_call_depth`，超限抛出 `AgentDepthExceededError`
+- 各执行方法为 CrewMember 构建 AgentConfig 时应设置 `call_depth = CrewLeader 的 depth + 1`，使限制向下传播
+
+### 第八轮问题修复统计
+
+| 类别 | 数量 | 说明 |
+|------|------|------|
+| 计时字段缺失 | 2 | AgentCrew 缺 completed_at、execute_crew 未设置 |
+| 计算逻辑错误 | 1 | total_duration_ms 用 sum 而非 wall-clock |
+| 文档缺口 | 2 | crew_id 生成时机、Crew 递归风险 |
+| 并发控制缺失 | 1 | _execute_dag 无 max_parallel |
+| Schema 不完整 | 1 | max_parallel 缺 JSON Schema default |
+| 容错机制缺失 | 1 | _aggregate_results LLM 失败无降级 |
+| 步骤重编号 | 2 | plan_crew / execute_crew 步骤合并与重编号 |
+| **第八轮合计** | **10** | |
+
+### 第八轮影响分析
+
+- **时序正确性**: 问题 67/68/70 的修复确保了 `total_duration_ms` 在所有执行策略下均反映真实的 wall-clock 时间。此前 PARALLEL/DAG 策略的时间统计存在系统性偏差，直接影响了性能监控和用户等待时间评估的准确性。
+- **并发安全边界**: 问题 72 将 DAG 就绪队列的并发度纳入 `max_parallel` 控制，防止了因依赖图结构导致的无限制线程创建，与 PARALLEL 策略形成了统一的并发控制模型。
+- **数据完整性**: 问题 73 的 LLM 聚合降级策略确保了最坏情况下已完成成员的工作不会丢失 — 用户至少能看到拼接的原始结果，而非空白错误信息。
+- **系统稳定性**: 问题 74 的递归保护将 Crew 嵌套纳入与 Agent 嵌套相同的深度限制体系，防止了因 LLM 自发决策导致的无限递归和资源耗尽。
+
+---
+
+## 第九轮深度审查 (补充修复)
+
+在对 Crew 机制进行第九次反复检查后，发现以下额外问题。本轮重点关注 Python 语义陷阱 (falsy 值)、规范缺口 (UUID 生成)、以及跨组件深度传播的完整性。
+
+### 追加文件变更清单
+
+| 序号 | 文件路径 | 变更说明 |
+|------|----------|----------|
+| I1 | `agent_doc/plan/03_tool_system.md` | execute_crew 将 `max_parallel or self.max_parallel` 修正为 `max_parallel if max_parallel is not None else self.max_parallel` (防止 0 被 falsy 回退); plan_crew 新增步骤 1 (LLM 输出临时标识符说明) + 步骤 2a (生成正式 UUID v4 + 依赖引用重映射); execute_crew 代码示例将 agent_pool.acquire 移入 try 块 (防止 acquire 异常时成员被静默跳过); _aggregate_results total_duration_ms 新增 max(0, ...) 防护; _execute_sequential 首个成员 context=None 行为文档化 + final_answer 简化设计说明; _execute_dag 新增波次模型并行槽位利用说明与连续流模型展望; AgentCrew 新增 crew_leader_call_depth 字段; plan_crew 签名新增 crew_leader_call_depth 参数 + 步骤 5 存储逻辑; execute_crew agent_factory 完善 AgentConfig 构造含 call_depth 传播; CrewOrchestrator 新增 config: Config 属性存储 |
+| I2 | `agent_doc/plan/01_base_agent.md` | form_crew() 新增 crew_leader_call_depth=self.config.call_depth 传递; launch_crew() 递归风险防护措施更新为 form_crew → plan_crew → execute_crew 的深度传播链路 |
+| I3 | `agent_doc/plan/06_specialized_agents.md` | §6 CrewResult 示例补充 crew_id 和 total_duration_ms 字段 |
+
+### 追加问题详情
+
+#### 问题 75: execute_crew 中 max_parallel 使用 `or` 运算导致 0 值被错误回退
+
+**发现**: `execute_crew()` 步骤 5 使用 `max_parallel or self.max_parallel` 判空。Python 中 `0 or 4` 求值为 `4` (因为 `0` 是 falsy), 导致当调用方显式传入 `max_parallel=0` (意图禁止并行, 在 DAG 模式下串行执行就绪成员) 时, 值被静默替换为 Config 默认值 4。
+
+**修复**: 将 `max_parallel or self.max_parallel` 改为 `max_parallel if max_parallel is not None else self.max_parallel`, 仅对 `None` 回退, 保留 `0` 作为合法值。
+
+#### 问题 76: plan_crew 未文档化 SubTask UUID 生成与依赖引用重映射
+
+**发现**: `SubTask.task_id` 注释要求 "UUID v4", 但 `plan_crew()` 步骤 2 直接将 LLM 返回的 JSON 解析为 SubTask 列表。LLM 无法可靠生成真正的 UUID v4 (通常输出 "task_1" 等简单标识符), 且 LLM 输出的临时标识符不能保证全局唯一性。此外, 若框架在步骤 5 替换 task_id 为真实 UUID, 则步骤 4 的依赖校验应在替换后进行, 而非替换前 — 但文档未描述替换步骤和依赖引用的重映射逻辑。
+
+**修复**: plan_crew 内部流程重构:
+- 步骤 1: Prompt 要求 LLM 使用临时标识符 (如 "task_1"), 明确告知 LLM 不要自行生成 UUID
+- 步骤 2a (新增): 生成正式 UUID v4 替换临时符 → 构建映射表 → 重映射所有 dependencies 引用
+- 步骤 4 补充说明: 校验针对已替换的正式 UUID
+
+#### 问题 77: agent_pool.acquire() 位于 try 块外, 异常时成员静默丢失
+
+**发现**: `execute_crew()` per-member 代码示例中, `agent_pool.acquire()` 在 try/except 块之外。若 acquire 因 AgentPool 耗尽或工厂函数抛出异常而失败:
+- 异常向上传播, 未创建任何 AgentResult
+- 该成员不会出现在 results 列表中
+- SEQUENTIAL 策略下后续成员全部被跳过
+- PARALLEL/DAG 策略下其他线程不受影响但该成员结果缺失
+- crew.members 列表中该成员 status 保持 PENDING, 与 "所有成员已执行完毕" 的 crew 状态矛盾
+
+**修复**: 代码示例重构为嵌套 try 结构 — 外层 try/except 包裹 agent_pool.acquire(), 捕获异常后将成员标记为 FAILED 并生成描述性 AgentResult, 然后 continue 到下一个成员; 内层 try/except/finally 包裹 agent.run() + agent_pool.release(), 仅在 acquire 成功时进入。
+
+#### 问题 78: total_duration_ms 在 completed_at 未设置时产生负值
+
+**发现**: `_aggregate_results` 步骤 4 计算 `(crew.completed_at - crew.created_at) * 1000`。若 `completed_at` 因异常执行路径未正确设置 (仍为默认值 0.0), 则结果为负数 (如 `-1715000000.0`), 写入 `CrewResult.total_duration_ms` 字段, 污染上层日志和监控。
+
+**修复**: 改为 `max(0, (crew.completed_at - crew.created_at)) * 1000`, 并补充注释说明正常路径下 `completed_at` 由 `execute_crew` 步骤 7 保证设置。
+
+#### 问题 79: _execute_sequential 首个成员 context=None 行为未文档化
+
+**发现**: `_execute_sequential` 文档说明首个成员使用原始 task.context (不合并 previous_result), 但未说明若 task.context 为 None 时, agent.run() 的 context 参数收到 None 是否合法。实现者可能误以为需要特殊初始化一个空 dict。
+
+**修复**: 补充说明 `agent.run()` 的 `context` 参数接受 `dict | None`, `None` 表示无上下文数据可用, 这是合法且预期的行为。
+
+#### 问题 80: CrewResult 示例缺少 crew_id 和 total_duration_ms
+
+**发现**: `06_specialized_agents.md` §6 的 CrewResult 示例 JSON 仅包含 `success`, `mission_summary`, `member_results`, `execution_order`, `failed_members`, `token_usage` 六个字段。但 `CrewResult` 数据类定义了 8 个字段, 缺少 `crew_id: str` 和 `total_duration_ms: float`。
+
+**修复**: 示例补充 `"crew_id": "a1b2c3d4-..."` 和 `"total_duration_ms": 15234.5`。
+
+#### 问题 81: _execute_dag 波次模型并行槽位利用不足未说明
+
+**发现**: `_execute_dag` 算法采用 "波次" (wave) 模型 — 每轮收集所有就绪成员, 全部并发执行, 等待全部完成后才检查新就绪成员。若一波中某成员耗时远短于其他成员, 其下游成员 (依赖已满足) 在整个波次完成前无法开始, 导致并行槽位闲置。
+
+**修复**: 新增 "执行模型说明" 段落, 解释波次模型的实现简单性与并行利用率的权衡, 并展望未来的连续流模型 (有界信号量 + 动态提交)。
+
+#### 问题 82: _execute_sequential 仅传递 final_answer 的简化设计未解释
+
+**发现**: `_execute_sequential` 仅将前一成员的 `final_answer` 字符串作为 `previous_result` 传递给下一成员, 而非完整的 `AgentResult` 对象。这意味着下游成员无法获取上游的 `token_usage`, `iterations` 等结构化数据。此设计选择有合理动机 (节省 context token, final_answer 是 LLM 最需要的输入), 但未在文档中解释。
+
+**修复**: 新增 "设计说明" 段落, 解释仅传递 final_answer 的理由 (LLM 易理解, 节省 token), 并指引需要完整结构化数据时使用 DAG 策略并在 task.context 中显式包含所需字段。
+
+#### 问题 83: agent_factory 未传播 call_depth, Crew 嵌套深度保护失效
+
+**发现**: `launch_crew()` 文档声明了 Crew 嵌套递归防护措施, 要求 CrewMember 的 AgentConfig 设置 `call_depth = CrewLeader depth + 1`。但 `execute_crew()` per-member 代码示例中的 agent_factory lambda 仅传递 `name` 和 `description` 两个参数给 `member.agent_cls()`, 未传递 `config` 和 `agent_config`。
+
+此问题的连锁影响:
+- CrewMember Agent 实例使用默认 `AgentConfig(call_depth=0)`, 其 LLM 若再次调用 launch_crew, 入口处的 `call_depth >= agent_max_call_depth` 检查永远通过 (0 < 3), Crew 嵌套递归保护完全失效
+- CrewMember Agent 也缺少全局 Config (LLM 端点/密钥等), 可能使用错误的默认配置
+
+**修复**:
+- `AgentCrew` 新增 `crew_leader_call_depth: int = 0` 字段
+- `plan_crew()` 签名新增 `crew_leader_call_depth` 参数, 步骤 5 存储到 AgentCrew
+- `form_crew()` 传递 `crew_leader_call_depth=self.config.call_depth`
+- `CrewOrchestrator` 新增 `config: Config` 属性 (存储在 `__init__` 中)
+- agent_factory lambda 补全: 传递 `config=self.config` + `agent_config=AgentConfig(call_depth=crew.crew_leader_call_depth + 1)`
+- `launch_crew()` 递归防护文档更新为完整的深度传播链路
+
+### 第九轮问题修复统计
+
+| 类别 | 数量 | 说明 |
+|------|------|------|
+| Python 语义陷阱 | 1 | max_parallel `or` 运算吞没 0 值 |
+| 规范缺口 | 1 | SubTask UUID 生成与依赖重映射机制 |
+| 异常处理缺陷 | 2 | acquire 在 try 外 + total_duration_ms 负值 |
+| 文档缺口 | 4 | 首个成员 context=None、波次模型限制、final_answer 简化设计、CrewResult 示例 |
+| 深度传播缺失 | 1 | agent_factory 未传播 call_depth (含 CrewOrchestrator.config 修复) |
+| **第九轮合计** | **9** | (问题 83 合并 4 个子修复) |
+
+### 九轮累计修复统计
+
+| 轮次 | 问题数 | 主要类型 |
+|------|--------|----------|
+| 第一轮 | 9 | 缺失定义、参数错误、类型错误、重复逻辑、依赖遗漏、拼写 |
+| 第二轮 | 8 | 依赖遗漏、文档结构、跨文档不一致、缺失结构、异常处理、语义不清、注释 |
+| 第三轮 | 11 | 生命周期管理缺失、功能集成缺失、文档冲突、参数传递、依赖遗漏、语义不明 |
+| 第四轮 | 9 | 类型不一致、属性缺失、执行细节缺失、错误处理缺失、示例不完整、选择指南 |
+| 第五轮 | 11 | 运行时逻辑错误、线程安全、资源管理缺陷、配置缺失、数据模型缺失、文档精确性 |
+| 第六轮 | 11 | 类型歧义、流程图逻辑错误、边界条件缺失、文档缺口、示例同步 |
+| 第七轮 | 10 | 代码示例错误、边界校验缺失、线程安全覆盖不全、错误处理不一致 |
+| 第八轮 | 10 | 计时字段缺失、duration 计算错误、并发上限缺失、LLM 容错缺失、递归风险 |
+| 第九轮 | 9 | Python 语义陷阱、UUID 生成规范缺口、异常传播缺陷、深度传播缺失 |
+| **总计** | **88** | |
+
+### 第九轮影响分析
+
+- **并发控制正确性**: 问题 75 的修复确保了 `max_parallel=0` 可作为合法的 "禁止并发" 语义被正确处理, 而非被 Python 的 falsy 语义静默覆盖。此 bug 在场效应 — 所有使用 `or` 判空的 None-or-default 模式在涉及 0 值时均受影响。
+- **标识符可靠性**: 问题 76 填补了 LLM 生成 UUID 的根本性不可靠问题。通过框架生成 UUID + 依赖引用重映射, SubTask 的 task_id 真正满足全局唯一性要求, 为分布式日志追踪和跨系统引用提供了可靠基础。
+- **异常完整性**: 问题 77 修复了 acquire 失败时的静默丢失问题 — 此前一个 AgentPool 耗尽故障可能导致 CrewResult 中少一个成员而无人察觉, 现在会被显式记录到 failed_members 并反映在 mission_summary 中。
+- **深度保护闭环**: 问题 83 是最关键的修复之一 — 此前 call_depth 传播链条在 agent_factory 处断裂, 导致所有 Crew 嵌套递归保护声明形同虚设 (CrewMember 始终使用 call_depth=0)。修复后 form_crew → plan_crew (存储) → execute_crew (工厂构造) 形成完整的深度传播链路, 与 launch_agent() 的深度保护形成一致的体系。
+- **跨组件配置完整性**: CrewOrchestrator.config 属性的补全不仅服务于 call_depth 传播, 也确保了 CrewMember Agent 实例能正确继承全局 LLM 配置 (端点/密钥/模型), 避免了因缺失 Config 导致的 LLM 调用失败。

@@ -373,6 +373,7 @@ CodeAgent (CrewLeader)
 # 执行结果: CrewResult
 # {
 #     "success": true,
+#     "crew_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
 #     "mission_summary": "已完成用户认证系统实现:
 #         1. CodeAgent 实现了 login/register/reset 三个端点
 #         2. DocAgent 生成了 API 文档 (含参数说明)
@@ -385,6 +386,7 @@ CodeAgent (CrewLeader)
 #         ("ShellAgent", "task_004", AgentResult(...))
 #     ],
 #     "execution_order": ["task_001", "task_002", "task_003", "task_004"],
+#     "total_duration_ms": 15234.5,
 #     "failed_members": [],
 #     "token_usage": TokenUsage(prompt_tokens=8500, completion_tokens=3200, total_tokens=11700)
 # }

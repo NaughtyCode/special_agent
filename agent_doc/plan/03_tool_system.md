@@ -482,13 +482,19 @@ class AgentCrew:
     - COMPLETED: 全部成员执行成功
     - FAILED:    至少一个成员执行失败 (不可恢复)
     """
-    crew_id: str                        # Crew 唯一标识 (UUID v4, 用于日志/审计追踪)
+    crew_id: str                        # Crew 唯一标识 (UUID v4, plan_crew 创建 AgentCrew 时生成,
+                                          # 用于日志/审计追踪)
     lead_agent_name: str                # CrewLeader (发起方 Agent) 名称,
                                           # 用于记录发起者便于审计
     mission: str                        # 团队使命 (原始任务描述, 作为 LLM 分解的输入)
     members: list[CrewMember]           # 团队成员列表 (plan_crew 阶段填充)
     status: str = "ASSEMBLED"           # ASSEMBLED → RUNNING → COMPLETED / FAILED
-    created_at: float = 0.0             # 创建时间戳 (time.time(), 用于计算总耗时)
+    created_at: float = 0.0             # 创建时间戳 (time.time(), plan_crew 设置)
+    completed_at: float = 0.0           # 完成时间戳 (time.time(), execute_crew 设置,
+                                          # 用于计算 wall-clock total_duration_ms)
+    crew_leader_call_depth: int = 0     # CrewLeader 的 call_depth (plan_crew 从 BaseAgent.form_crew 获取,
+                                          # 用于为 CrewMember 构建 AgentConfig 时设置 call_depth + 1,
+                                          # 实现 Crew 嵌套递归深度限制的向下传播)
 
 @dataclass
 class CrewResult:
@@ -593,6 +599,10 @@ class CrewOrchestrator:
     max_parallel: int                   # 最大并行成员数 (从 Config.crew_max_parallel, 默认 4)
     crew_max_iterations: int            # Crew 级任务分解最大迭代 (从 Config.crew_max_iterations, 默认 3)
     plan_temperature: float             # 任务分解时的 LLM 温度 (从 Config.crew_plan_temperature, 默认 0.4)
+    config: Config                      # 全局 Config 引用 — 除 Crew 专用配置外,
+                                          # 还用于 agent_factory 中为 CrewMember 构造 Agent 实例时传递
+                                          # Config (LLM 端点/密钥等), 以及 _aggregate_results 中读取
+                                          # llm_temperature 等非 Crew 专用配置
 
     # ── 构造 ─────────────────────────────────────────
     def __init__(self, agent_registry: AgentRegistry,
@@ -603,13 +613,15 @@ class CrewOrchestrator:
         """
         初始化 CrewOrchestrator。
         - 绑定 AgentRegistry / AgentPool / LLMClient / EventBus
+        - 存储 Config 引用到 self.config
         - 从 Config 读取 crew_max_parallel / crew_max_iterations / crew_plan_temperature
         """
 
     # ── Plan: 任务分解与 Agent 匹配 ───────────────────
     def plan_crew(self, mission: str,
                   lead_agent_name: str,
-                  available_agents: list[AgentMeta] | None = None
+                  available_agents: list[AgentMeta] | None = None,
+                  crew_leader_call_depth: int = 0
                   ) -> AgentCrew:
         """
         将 mission 分解为 SubTask 列表, 并为每个子任务匹配最佳 Agent。
@@ -619,11 +631,20 @@ class CrewOrchestrator:
 
         内部流程:
         1. 构建分解 Prompt (含可用 Agent 列表与能力描述)
+           Prompt 要求 LLM 为每个 SubTask 输出临时标识符 (如 "task_1", "task_2"),
+           并在 dependencies 中使用这些临时标识符引用依赖关系。
+           LLM 不应自行生成 UUID — 框架会在后续步骤中替换为真正的 UUID v4。
         2. LLM 分析 mission (使用 self.plan_temperature 温度),
            输出结构化子任务列表 (JSON)
            - 若 LLM 输出无法解析为有效 JSON, 进行最多 crew_max_iterations 次重试,
              每次重试将解析错误作为反馈发送给 LLM 要求修正格式
            - 若全部重试耗尽仍失败, 抛出 CrewPlanError (含原始 LLM 输出供调试)
+        2a. 生成正式 task_id:
+           - 为每个 SubTask 生成真正的 UUID v4 作为 task_id
+           - 构建临时标识符 → 正式 UUID 的映射表
+           - 遍历所有 SubTask.dependencies, 将临时标识符引用替换为正式 UUID
+           - 此步骤确保 task_id 全局唯一且依赖引用可靠,
+             LLM 无法可靠生成 UUID v4, 因此不能依赖 LLM 输出作为正式标识符
         3. 每个子任务通过 AgentRegistry.match_agent() 匹配最佳 Agent
            - 若某个 SubTask 匹配失败 (无 Agent 满足 required_tags 或匹配得分低于阈值),
              抛出 CrewPlanError(f"no agent matched for subtask '{task_id}'"),
@@ -633,9 +654,16 @@ class CrewOrchestrator:
            - 遍历每个 SubTask.dependencies, 检查其中每个 task_id 是否存在于集合中
            - 若引用了不存在的 task_id, 抛出 CrewPlanError(f"dependency '{dep}' not found")
            - 若存在循环依赖 (DFS 检测), 抛出 CrewPlanError("circular dependency detected")
-        5. 构建 AgentCrew (含 CrewMember 列表)
-        6. 设置 crew.created_at = time.time() (记录创建时间戳, 用于计算总耗时)
-        7. 发布 CrewLifecycleEvent.PLANNED (携带 CrewEvent 负载)
+           (步骤 2a 已确保 dependencies 使用正式 UUID, 因此此处校验的是最终标识符)
+        5. 构建 AgentCrew:
+           - 生成 crew_id (UUID v4)
+           - 填充 CrewMember 列表
+           - 设置 created_at = time.time()
+           - 设置 crew_leader_call_depth = 参数 crew_leader_call_depth
+             (由 BaseAgent.form_crew 传入 self.config.call_depth,
+              供 execute_crew 为成员构建 AgentConfig 时计算 call_depth + 1)
+           - completed_at 保持默认值 0.0 (由 execute_crew 在执行完成时设置)
+        6. 发布 CrewLifecycleEvent.PLANNED (携带 CrewEvent 负载)
 
         返回已组建但尚未执行的 AgentCrew (status=ASSEMBLED)。
 
@@ -663,9 +691,11 @@ class CrewOrchestrator:
         4. 发布 CrewLifecycleEvent.STARTED (携带 CrewEvent 负载, 含 crew_id 和 strategy)
         5. 根据 strategy 分发:
            - SEQUENTIAL → _execute_sequential(crew)
-           - PARALLEL   → _execute_parallel(crew, max_parallel or self.max_parallel)
-             (max_parallel 为 None 时回退到 self.max_parallel, 即 Config.crew_max_parallel)
-           - DAG        → _execute_dag(crew)
+           - PARALLEL   → _execute_parallel(crew, max_parallel if max_parallel is not None else self.max_parallel)
+             (max_parallel 为 None 时回退到 self.max_parallel, 即 Config.crew_max_parallel;
+              使用 `is not None` 判断而非 `or`, 因为 0 是合法的并发限制值, 不应被回退覆盖)
+           - DAG        → _execute_dag(crew, max_parallel if max_parallel is not None else self.max_parallel)
+             (DAG 就绪队列并发执行也受 max_parallel 限制, 防止无限线程创建)
         6. 在各执行方法内部, 每个成员执行: AgentPool.acquire → agent.run(task) → AgentPool.release
            每个成员必须使用 try/finally 确保 AgentPool.release 在异常时也被调用,
            避免 AgentPool 实例泄漏:
@@ -673,10 +703,27 @@ class CrewOrchestrator:
            # AgentPool.acquire 第二参数为工厂函数 (零参数 callable), 用于按需创建新实例;
            # 工厂内部需传递 Agent 类所需的全部构造参数 (name/description/config/agent_config),
            # 这些参数可从 CrewLeader 继承 (如 config) 或从 CrewMember 元数据获取
-           member.agent_instance = agent_pool.acquire(member.agent_name,
-               agent_factory=lambda: member.agent_cls(
-                   name=member.agent_name,
-                   description=agent_registry.get_agent_meta(member.agent_name).description))
+           # 关键: agent_config 必须设置 call_depth = crew.crew_leader_call_depth + 1,
+           #   使 Crew 嵌套递归深度限制正确向下传播 (与 launch_agent 保护机制一致)
+           try:
+               member.agent_instance = agent_pool.acquire(member.agent_name,
+                   agent_factory=lambda: member.agent_cls(
+                       name=member.agent_name,
+                       description=agent_registry.get_agent_meta(member.agent_name).description,
+                       config=self.config,  # 继承全局 Config (LLM 端点/密钥等)
+                       agent_config=AgentConfig(
+                           call_depth=crew.crew_leader_call_depth + 1)))
+           except Exception as e:
+               # acquire 失败 (如 AgentPool 耗尽或工厂函数异常) —
+               # 标记为 FAILED 并跳过此成员, 不终止整个 Crew 执行
+               member.status = "FAILED"
+               member.result = AgentResult(
+                   success=False, final_answer=str(e),
+                   iterations=[], token_usage=TokenUsage(),
+                   total_duration_ms=0, finish_reason=FinishReason.ERROR,
+                   error=ToolExecutionError(str(e)))
+               member.completed_at = time.time()
+               continue  # 跳过此成员, 继续处理下一个 (SEQUENTIAL) 或释放槽位 (PARALLEL/DAG)
            try:
                member.status = "RUNNING"
                member.started_at = time.time()
@@ -697,10 +744,12 @@ class CrewOrchestrator:
            (每个成员执行时发布 MEMBER_STARTED / MEMBER_COMPLETED / MEMBER_FAILED,
             MEMBER_COMPLETED 携带 duration_ms=completed_at-started_at,
             MEMBER_FAILED 携带 error_message)
-        7. 汇总所有成员结果 → 调用 _aggregate_results
-        8. 设置 crew.status = "COMPLETED" (全部成功) 或 "FAILED" (有失败成员)
-        9. 发布 CrewLifecycleEvent.COMPLETED 或 FAILED (携带 CrewEvent 负载)
-        10. 返回 CrewResult
+        7. 设置 crew.completed_at = time.time() (记录完成时间戳, 用于计算 wall-clock 总耗时)
+        8. 汇总所有成员结果 → 调用 _aggregate_results(crew, results)
+           (_aggregate_results 内部以 crew.completed_at - crew.created_at 计算 total_duration_ms)
+        9. 根据聚合结果设置 crew.status = "COMPLETED" (全部成功) 或 "FAILED" (有失败成员)
+        10. 发布 CrewLifecycleEvent.COMPLETED 或 FAILED (携带 CrewEvent 负载)
+        11. 返回 CrewResult
         """
 
     def _execute_sequential(self, crew: AgentCrew) -> list[tuple[str, str, AgentResult]]:
@@ -714,6 +763,8 @@ class CrewOrchestrator:
         - agent.run(user_input=task.description, context=task.context)
 
         首个成员使用 plan_crew 阶段分配的原始 task.context (无 previous_result),
+        若 task.context 为 None 则直接传递 None 给 agent.run()
+        (agent.run() 的 context 参数接受 dict | None, None 表示无可用的上下文数据),
         后续每个成员执行前, 将前一成员的结果合并入 context:
         - 若 task.context 为 None, 先初始化为空 dict {}
         - context["previous_result"] = 前一成员的 final_answer
@@ -723,6 +774,12 @@ class CrewOrchestrator:
         确保信息在任务链中流动。context 合并策略: 保留原有 task.context 的键,
         新增 "previous_result" 键存储前一成员的 final_answer,
         若键冲突则以新增的 "previous_result" 为准。
+
+        设计说明: 仅传递 final_answer 字符串而非完整 AgentResult 是有意简化 —
+        final_answer 是 LLM 可直接理解的文本, 而 AgentResult 的结构化数据
+        (iterations, token_usage 等) 对下游 LLM 的语义理解帮助有限且消耗 context token。
+        若下游任务需要上游的完整结构化结果, 应使用 DAG 策略并在 task.context 中
+        显式包含所需字段。
 
         适用于有强顺序依赖的任务链。
 
@@ -757,7 +814,7 @@ class CrewOrchestrator:
         与 members 列表顺序一致。返回的 list 顺序即 execution_order (task_id 列表)。
         """
 
-    def _execute_dag(self, crew: AgentCrew) -> list[tuple[str, str, AgentResult]]:
+    def _execute_dag(self, crew: AgentCrew, max_parallel: int) -> list[tuple[str, str, AgentResult]]:
         """
         DAG 执行 — 按依赖关系拓扑排序, 无依赖的成员可并行。
 
@@ -772,7 +829,8 @@ class CrewOrchestrator:
            抛出 CrewPlanError("circular dependency detected in DAG"),
            因为含环的 DAG 无法确定执行起点
         3. 找出所有入度为 0 的成员, 加入就绪队列
-        4. 并发执行就绪队列中的所有成员
+        4. 并发执行就绪队列中的所有成员 (受 max_parallel 限制,
+           使用 ThreadPoolExecutor(max_workers=max_parallel))
         5. 每完成一个成员, 将其结果传递给所有依赖它的后续成员:
            context 合并策略 — 若 task.context 为 None, 先初始化为空 dict {};
            保留原有键, 新增 "dependency_results" 键 (dict[task_id, final_answer]),
@@ -784,6 +842,13 @@ class CrewOrchestrator:
         若某成员失败, 依赖它的后续成员仍会执行:
         失败信息通过 context["dependency_errors"] 传递 (dict[task_id, error_message]),
         不会因单点失败导致整个 DAG 阻塞。
+
+        执行模型说明: 上述算法采用"波次" (wave) 模型 — 每轮找出所有就绪成员,
+        并发执行, 全部完成后才检查新就绪成员并开始下一波。此模型实现简单,
+        但在以下场景中并行槽位可能未充分利用: 某成员执行时间远短于同波其他成员时,
+        它无法提前触发其下游成员进入就绪状态。未来版本可优化为连续流模型:
+        使用有界信号量 (max_parallel) 控制并发, 任一成员完成时立即检查并
+        提交新就绪成员到执行器, 使并行槽位始终保持饱和。
 
         线程安全: 并发执行时, 以下字段的读写必须通过 threading.Lock 保护:
         - crew.members[i].status — 防止两个线程同时判定依赖满足并重复执行
@@ -809,12 +874,22 @@ class CrewOrchestrator:
            - 若 AgentResult.success == False → 将 (agent_name, task_id) 记录到
              failed_members 列表, 提取 error 信息作为上下文
         2. 将所有 member final_answer 和失败信息拼接为上下文
-        3. 调用 LLM 生成统一的 mission_summary
+        3. 调用 LLM 生成统一的 mission_summary:
            使用 Config.llm_temperature (默认 0.7) 而非 plan_temperature (默认 0.4),
            因为聚合任务是总结性工作, 需要一定的语言表达灵活性,
-           而 plan_temperature 追求的是分解的结构稳定性
-        4. 计算 total_duration_ms (sum of all member durations) 和
-           total token_usage (sum of all member token_usage)
+           而 plan_temperature 追求的是分解的结构稳定性。
+           若 LLM 调用失败 (超时/限流/不可恢复错误), 降级为人工拼接:
+           mission_summary = "\n\n".join([f"[{agent_name}] {result.final_answer}"
+                                          for agent_name, task_id, result in results]),
+           确保已完成的所有成员工作不会因聚合失败而丢失
+        4. 计算 total_duration_ms 和 total_token_usage:
+           - total_duration_ms = max(0, (crew.completed_at - crew.created_at)) * 1000
+             (wall-clock 时间, 反映用户实际等待时长; 各成员的独立耗时可通过
+             member_results 中每个 AgentResult.total_duration_ms 获取;
+             使用 max(0, ...) 防止 completed_at 因异常路径未正确设置时产生负值,
+             正常路径下 completed_at 由 execute_crew 步骤 7 保证设置)
+           - total_token_usage = sum of all member token_usage
+             (token 量可累加, 不受并发影响)
         5. 从 results 每个 tuple 中提取 task_id (第二个元素) 构建 execution_order,
            顺序与执行方法返回的 results 顺序一致
            (SEQUENTIAL: members 列表顺序; PARALLEL: 提交顺序;
@@ -984,7 +1059,8 @@ class CrewTool(BaseTool):
                 },
                 "max_parallel": {
                     "type": "integer",
-                    "description": "并行模式下最大并发成员数 (默认 4)"
+                    "description": "并行模式下最大并发成员数",
+                    "default": 4
                 }
             },
             "required": ["mission"]
