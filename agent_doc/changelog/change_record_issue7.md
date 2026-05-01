@@ -6,17 +6,19 @@
 |------|------|
 | 修改编号 | issue7 |
 | 修改日期 | 2026-05-01 |
-| 修改类型 | Crew 机制深度审查 (四轮) — 补全缺失定义、修复跨文档不一致、增强注释与错误处理、修复生命周期管理缺失、修复类型不一致与执行细节缺失 |
+| 修改类型 | Crew 机制深度审查 (五轮) — 补全缺失定义、修复跨文档不一致、增强注释与错误处理、修复生命周期管理缺失、修复类型不一致与执行细节缺失、修复运行时逻辑错误与资源管理缺陷 |
 | 关联文档 | `agent_doc/plan/` (00, 01, 03, 06, 07, 08) |
 | 修改人 | SpecialArchAgent |
 
 ## 修改概述
 
-对 Issue #6 新增的 Crew 团队编排机制进行两轮反复深度审查。
+对 Issue #6 新增的 Crew 团队编排机制进行五轮反复深度审查。
 
 **第一轮**: 修复缺失的类定义、配置字段缺失、方法参数传递错误、事件定义格式错误、事件发布重复、依赖关系遗漏等问题。
 
 **第二轮**: 修复模块依赖图与路线图遗漏 EventBus、文档节号跳跃与代码示例冲突、编排流程图不一致、Crew 事件负载缺失、异常处理缺失、success 语义模糊等问题，并为所有 Crew 相关数据模型和方法补充详细注释。
+
+**第五轮**: 修复运行时逻辑错误 (strategy 解析未捕获异常)、线程安全文档缺失、execution_order 填充逻辑缺失、资源管理缺陷 (AgentPool acquire/release 无 finally)、AgentConfig Crew 覆写字段缺失、CrewMember 计时字段缺失、空 mission 校验缺失、PARALLEL 策略依赖警告缺失、聚合方法步骤编号重复等问题。
 
 ## 文件变更清单
 
@@ -550,3 +552,144 @@ self.tool_manager.register(CrewTool(agent=self))
 - **接口契约完整性**: 问题 27/28/29 补全了 SubTask 到 agent.run() 的映射约定, 实现者无需猜测参数传递方式, 且不同执行策略的 context 合并语义明确无歧义。
 - **运行时健壮性**: 问题 29 的 JSON 重试机制 + CrewPlanError 确保了 LLM 输出不可靠时的优雅降级, 避免了未捕获异常导致 Agent 进入 ERROR 状态。
 - **开发者体验**: 问题 30 使自定义 Agent 示例包含 CrewTool 注册, 新开发者复制示例即可获得完整的 CrewLeader 能力, 避免因遗漏注册而导致功能不可用。
+
+---
+
+## 第五轮深度审查 (补充修复)
+
+在对 Crew 机制进行第五次反复检查后，发现以下额外问题。本轮重点关注运行时逻辑错误、资源管理缺陷、以及跨模块配置一致性问题。
+
+### 追加文件变更清单
+
+| 序号 | 文件路径 | 变更说明 |
+|------|----------|----------|
+| E1 | `agent_doc/plan/03_tool_system.md` | CrewTool.execute() 将 ExecutionStrategy() 解析移入 try/except 块内; _execute_dag 补充线程安全文档; 三种执行方法补充 execution_order 填充逻辑; _execute_sequential 补充首个成员上下文说明; 三种执行方法补充 per-member try/finally AgentPool acquire/release 模式; plan_crew() 新增空 mission 校验; _execute_parallel 新增依赖忽略警告; CrewMember 新增 started_at/completed_at 计时字段; _aggregate_results 补充 LLM 温度参数说明 + 修复步骤编号重复 |
+| E2 | `agent_doc/plan/01_base_agent.md` | AgentConfig 新增 Crew 覆写字段 (crew_max_parallel_override, crew_strategy_override) |
+
+### 追加问题详情
+
+#### 问题 33: CrewTool.execute() strategy 解析未捕获异常
+
+**发现**: `CrewTool.execute()` 中 `strategy = ExecutionStrategy(strategy_str)` 位于 try/except 块之前。若 LLM 传入非法的 strategy 字符串 (如 `"sequentiall"` 拼写错误), `ExecutionStrategy()` 构造函数将抛出 `ValueError`, 此异常不会被 try/except 捕获, 向上传播到 ReAct 循环导致 Agent 进入 ERROR 状态。
+
+**修复**: 将 `ExecutionStrategy(strategy_str)` 解析移至 try/except 块内部, 使 `ValueError` 被捕获并返回 `ToolResult(success=False, error=...)` 反馈给 LLM, LLM 可自行修正。
+
+#### 问题 34: _execute_dag 缺少线程安全文档
+
+**发现**: `_execute_dag` 在并发执行就绪队列成员时, 多个线程同时读写 `crew.members[i].status`、`crew.members[i].result` 以及 `execution_order` 列表。若不加锁保护, 存在数据竞争风险:
+- 两个线程同时判定某成员的依赖已满足, 导致重复执行
+- execution_order 列表并发 append 导致顺序错乱或数据损坏
+
+**修复**: `_execute_dag` 文档补充线程安全说明: 对 crew.members[i].status/result 的读写必须通过 threading.Lock 保护, 每个 CrewMember 使用独立锁, 或对就绪队列操作使用单一锁 + 原子状态更新。
+
+#### 问题 35: execution_order 填充逻辑未文档化
+
+**发现**: `CrewResult.execution_order: list[str]` 字段已定义 (存储 task_id 列表), 但三种执行方法均未说明如何填充此列表。实现者需自行推断每个方法应有的填充顺序:
+- SEQUENTIAL: 按 members 列表顺序 (即 plan_crew 分解顺序)
+- PARALLEL: 按提交顺序 (submit 顺序)
+- DAG: 按拓扑完成顺序 (先完成的先记录)
+
+**修复**: 三种执行方法文档均补充 `execution_order` 填充说明, 明确各策略下 task_id 的记录顺序。`_aggregate_results` 步骤 5 同步更新为从 results 提取 execution_order。
+
+#### 问题 36: _execute_sequential 首个成员上下文未说明
+
+**发现**: `_execute_sequential` 文档说明后续成员可通过 context 接收前一成员的结果, 但未说明第一个成员的 context 初始值是什么。实现者可能误以为需要特殊初始化。
+
+**修复**: 补充说明: "第一个 (索引 0) 成员使用其原始的 task.context, 不做任何合并; 从第二个成员开始, 才将前一成员的结果合并到 context 中。"
+
+#### 问题 37: AgentPool acquire/release 缺少 try/finally 保护
+
+**发现**: 三种执行方法的代码示例中, `agent_pool.acquire()` 和 `agent_pool.release()` 之间没有 try/finally 保护。若 `agent.run()` 抛出异常, `agent_pool.release()` 不会被调用, 导致 Agent 实例泄漏 — 被 acquire 的实例永远不会归还到池中, 最终 AgentPool 耗尽。
+
+**修复**: 三种执行方法均补充 per-member try/finally 代码模式:
+```python
+member.agent_instance = agent_pool.acquire(member.agent_name, ...)
+try:
+    member.status = "RUNNING"
+    member.started_at = time.time()
+    member.result = agent.run(task.description, task.context)
+    member.status = "DONE"
+except Exception as e:
+    member.status = "FAILED"
+    member.result = AgentResult(success=False, final_answer=str(e), ...)
+finally:
+    member.completed_at = time.time()
+    agent_pool.release(member.agent_instance)
+```
+
+#### 问题 38: AgentConfig 缺少 Crew 覆写字段
+
+**发现**: `AgentConfig` (定义于 `01_base_agent.md`) 支持覆写 LLM 模型/温度/迭代次数等参数, 但未提供 Crew 相关配置的覆写。当不同 Agent 需要不同的 Crew 执行策略或并行数时, 只能使用全局 Config, 无法实现 per-agent 调参。
+
+**修复**: `AgentConfig` 新增:
+```python
+crew_max_parallel_override: int | None = None   # 覆写 Crew 最大并行数
+crew_strategy_override: str | None = None       # 覆写默认执行策略
+```
+CrewOrchestrator 执行时优先读取 AgentConfig 覆写值, 回退到全局 Config。
+
+#### 问题 39: CrewMember 缺少计时字段
+
+**发现**: `CrewMember` 数据模型包含 `status` 和 `result` 字段, 但没有 `started_at` 和 `completed_at` 时间戳字段。这使得:
+- 无法计算单个成员的执行耗时
+- `CrewResult.total_duration_ms` 只能通过整个 Crew 的起止时间计算, 精度不足
+- 事件负载 (CrewEvent) 无法携带 per-member 的 duration_ms
+
+**修复**: `CrewMember` 新增 `started_at: float = 0.0` 和 `completed_at: float = 0.0` 字段, 在三种执行方法中于 try/finally 块中设置。
+
+#### 问题 40: _aggregate_results LLM 温度参数未文档化
+
+**发现**: `_aggregate_results` 步骤 3 调用 LLM 生成 mission_summary, 但未说明使用哪个温度参数。Config 中同时存在 `llm_temperature` (通用) 和 `crew_plan_temperature` (规划专用, 默认 0.4)。聚合任务属于总结性工作而非规划性工作, 若错误使用 `crew_plan_temperature` (0.4) 会导致输出过于机械, 而使用 `llm_temperature` (默认 0.7) 更适合自然语言总结。
+
+**修复**: `_aggregate_results` 步骤 3 明确标注使用 `Config.llm_temperature` (默认 0.7) 而非 `plan_temperature`, 并说明原因: 聚合是总结性工作, 需要语言表达灵活性; plan_temperature 追求的是分解的结构稳定性。
+
+#### 问题 41: plan_crew() 缺少空 mission 校验
+
+**发现**: `plan_crew()` 未校验 `mission` 参数是否为空字符串。若调用方传入空 mission, LLM 将收到无意义的 prompt, 可能返回空列表或无关内容, 导致后续执行出现难以调试的错误。
+
+**修复**: `plan_crew()` 前置条件新增: mission 必须非空且去除空白后长度 > 0, 否则抛出 `ValueError("mission must be non-empty")`。
+
+#### 问题 42: _execute_parallel 未警告依赖被忽略
+
+**发现**: `_execute_parallel` 以最大并发度执行所有成员, 不检查 `SubTask.dependencies`。若 plan_crew 阶段错误地为并行场景分配了依赖关系, 这些依赖会被静默忽略, 导致执行结果不符合预期。
+
+**修复**: `_execute_parallel` 文档新增警告: "PARALLEL 策略忽略 SubTask.dependencies, 所有成员同时执行。若子任务之间存在实际依赖, 应使用 DAG 策略。plan_crew() 在选择 PARALLEL 策略时应确保分解出的 SubTask 无依赖关系。"
+
+#### 问题 43: _aggregate_results 步骤编号重复
+
+**发现**: `_aggregate_results` 方法文档中, 步骤 6 "判定整体 success" 和步骤 7 "构建并返回 CrewResult" 均被编号为 `6.`, 导致步骤编号重复。
+
+**修复**: 将最后一个步骤的编号从 `6.` 修正为 `7.`。
+
+### 第五轮问题修复统计
+
+| 类别 | 数量 | 说明 |
+|------|------|------|
+| 运行时逻辑错误 | 1 | CrewTool.execute() strategy 解析未捕获异常 |
+| 线程安全文档缺失 | 1 | _execute_dag 并发写入无锁保护说明 |
+| 执行细节缺失 | 2 | execution_order 填充逻辑、首个成员上下文说明 |
+| 资源管理缺陷 | 1 | AgentPool acquire/release 无 try/finally |
+| 配置缺失 | 1 | AgentConfig 缺 Crew 覆写字段 |
+| 数据模型缺失 | 1 | CrewMember 缺计时字段 |
+| 文档精确性 | 3 | 聚合温度参数、空 mission 校验、PARALLEL 依赖警告 |
+| 编号错误 | 1 | _aggregate_results 步骤 6 重复 |
+| **第五轮合计** | **11** | |
+
+### 五轮累计修复统计
+
+| 轮次 | 问题数 | 主要类型 |
+|------|--------|----------|
+| 第一轮 | 9 | 缺失定义、参数错误、类型错误、重复逻辑、依赖遗漏、拼写 |
+| 第二轮 | 8 | 依赖遗漏、文档结构、跨文档不一致、缺失结构、异常处理、语义不清、注释 |
+| 第三轮 | 11 | 生命周期管理缺失、功能集成缺失、文档冲突、参数传递、依赖遗漏、语义不明 |
+| 第四轮 | 9 | 类型不一致、属性缺失、执行细节缺失、错误处理缺失、示例不完整、选择指南 |
+| 第五轮 | 11 | 运行时逻辑错误、线程安全、资源管理缺陷、配置缺失、数据模型缺失、文档精确性 |
+| **总计** | **48** | |
+
+### 第五轮影响分析
+
+- **运行时健壮性**: 问题 33 确保了 LLM 传入非法 strategy 值时优雅降级而非崩溃; 问题 37 的 try/finally 模式杜绝了 Agent 实例泄漏, 保证了 AgentPool 的长期稳定运行。
+- **并发安全**: 问题 34 明确了 DAG 执行中的线程安全要求, 防止数据竞争导致的依赖解析错误或结果丢失。
+- **可观测性**: 问题 35 (execution_order) 和问题 39 (CrewMember 计时字段) 使 Crew 执行的追踪和调试成为可能, 为未来的监控/审计功能奠定基础。
+- **配置粒度**: 问题 38 使每个 Agent 可独立调整 Crew 策略和并行度, 与 AgentConfig 现有的模型/温度覆写形成一致的 per-agent 调参体系。
+- **文档完整性**: 问题 40/41/42/43 消除了边界行为的不确定性, 实现者不再需要猜测聚合温度选择、空输入处理或并行策略的依赖行为。

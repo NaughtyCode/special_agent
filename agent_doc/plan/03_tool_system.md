@@ -443,6 +443,9 @@ class CrewMember:
     task: SubTask | None = None         # 分配的子任务 (含任务描述和依赖信息)
     status: str = "PENDING"             # PENDING → RUNNING → DONE / FAILED
     result: AgentResult | None = None   # 执行结果 (DONE/FAILED 时填充)
+    started_at: float = 0.0             # 开始执行时间戳 (time.time(), RUNNING 时设置)
+    completed_at: float = 0.0           # 完成时间戳 (time.time(), DONE/FAILED 时设置)
+                                         # duration = completed_at - started_at, 用于性能诊断
 
 @dataclass
 class AgentCrew:
@@ -482,11 +485,13 @@ class CrewResult:
     success: bool                       # 整体是否成功 (全部子任务成功 = True)
     crew_id: str                        # 来源 Crew 的 ID
     mission_summary: str                # LLM 汇总的团队使命报告 (失败时含错误说明)
-    member_results: list[tuple[str, AgentResult]]  # (agent_name, result) 列表
+    member_results: list[tuple[str, str, AgentResult]]  # (agent_name, task_id, result) 列表
+                                                        # task_id 确保同类型 Agent 结果可区分
     execution_order: list[str]          # 子任务执行顺序 (task_id 列表)
     total_duration_ms: float            # 总耗时 (毫秒)
     token_usage: TokenUsage             # 团队总 Token 用量
-    failed_members: list[str]           # 失败的成员 Agent 名称列表 (全部成功时为空)
+    failed_members: list[tuple[str, str]]  # 失败的成员 (agent_name, task_id) 列表 (全部成功时为空)
+                                           # 使用 task_id 而非 agent_name 作为唯一标识
 
 # ── 执行策略枚举 ──────────────────────────────────
 
@@ -495,7 +500,10 @@ class ExecutionStrategy(Enum):
     Crew 执行策略 — 决定子任务以何种顺序执行。
 
     SEQUENTIAL: 按 plan 返回顺序依次执行, 前一个完成后才开始下一个
-    PARALLEL:   并发执行所有无依赖关系的子任务 (最大并发数可配置)
+    PARALLEL:   并发执行所有子任务 (忽略 dependencies 字段, 最大并发数可配置)。
+                注意: 若 SubTask 定义了 dependencies 但使用 PARALLEL 策略,
+                依赖关系被忽略, 执行顺序不确定, 可能导致依赖任务因缺少上游结果而失败。
+                使用 PARALLEL 前应确保所有 SubTask.dependencies 均为空列表。
     DAG:        按依赖关系拓扑排序后执行, 无依赖的可并行
     """
     SEQUENTIAL = "sequential"
@@ -584,6 +592,9 @@ class CrewOrchestrator:
         """
         将 mission 分解为 SubTask 列表, 并为每个子任务匹配最佳 Agent。
 
+        前置条件: mission 必须为非空字符串, 否则抛出 ValueError
+        (空 mission 无法被 LLM 合理分解, 会导致无意义的 LLM 调用)。
+
         内部流程:
         1. 构建分解 Prompt (含可用 Agent 列表与能力描述)
         2. LLM 分析 mission (使用 self.plan_temperature 温度),
@@ -619,6 +630,20 @@ class CrewOrchestrator:
         3. 发布 CrewLifecycleEvent.STARTED (携带 CrewEvent 负载, 含 crew_id 和 strategy)
         4. 根据 strategy 分发到 _execute_sequential / _execute_parallel / _execute_dag
         5. 每个成员执行: AgentPool.acquire → agent.run(task) → AgentPool.release
+           每个成员必须使用 try/finally 确保 AgentPool.release 在异常时也被调用,
+           避免 AgentPool 实例泄漏:
+           ```
+           member.agent_instance = agent_pool.acquire(member.agent_name, ...)
+           try:
+               member.status = "RUNNING"
+               member.result = agent.run(task.description, task.context)
+               member.status = "DONE"
+           except Exception as e:
+               member.status = "FAILED"
+               member.result = AgentResult(success=False, final_answer=str(e), ...)
+           finally:
+               agent_pool.release(member.agent_instance)
+           ```
            (每个成员执行时发布 MEMBER_STARTED / MEMBER_COMPLETED / MEMBER_FAILED,
             各携带 CrewEvent 负载含 crew_id, member_name, task_id)
         6. 汇总所有成员结果 → 调用 _aggregate_results
@@ -627,7 +652,7 @@ class CrewOrchestrator:
         9. 返回 CrewResult
         """
 
-    def _execute_sequential(self, crew: AgentCrew) -> list[tuple[str, AgentResult]]:
+    def _execute_sequential(self, crew: AgentCrew) -> list[tuple[str, str, AgentResult]]:
         """
         串行执行 — 按 members 列表顺序依次执行每个成员。
 
@@ -636,6 +661,11 @@ class CrewOrchestrator:
 
         每个成员执行时, 将 SubTask 映射为 agent.run() 参数:
         - agent.run(user_input=task.description, context=task.context)
+
+        首个成员使用 plan_crew 阶段分配的原始 task.context (无 previous_result),
+        后续每个成员执行前, 将前一成员的结果合并入 context:
+        - context["previous_result"] = 前一成员的 final_answer
+        - context["previous_error"] = 前一成员的错误信息 (如有)
 
         前一成员的结果 (final_answer) 自动作为后一成员的 task.context 传入,
         确保信息在任务链中流动。context 合并策略: 保留原有 task.context 的键,
@@ -646,10 +676,14 @@ class CrewOrchestrator:
 
         若任一成员失败, 默认继续执行后续成员 (不立即终止),
         失败信息会通过 context["previous_error"] 传递给后续成员作为上下文参考。
+
+        返回的 list[tuple[str, str, AgentResult]] 按执行顺序排列 (即 members 列表顺序),
+        每个 tuple 为 (agent_name, task_id, AgentResult),
+        此顺序即 execution_order (task_id 列表)。
         """
 
     def _execute_parallel(self, crew: AgentCrew,
-                          max_parallel: int) -> list[tuple[str, AgentResult]]:
+                          max_parallel: int) -> list[tuple[str, str, AgentResult]]:
         """
         并行执行 — 并发执行所有成员 (受 max_parallel 限制)。
 
@@ -665,9 +699,10 @@ class CrewOrchestrator:
         适用于成员间无依赖的独立子任务 (如同时搜索多个信息源)。
 
         返回结果按提交顺序排列, 与 members 列表顺序一致。
+        返回的 list 顺序即 execution_order (task_id 列表)。
         """
 
-    def _execute_dag(self, crew: AgentCrew) -> list[tuple[str, AgentResult]]:
+    def _execute_dag(self, crew: AgentCrew) -> list[tuple[str, str, AgentResult]]:
         """
         DAG 执行 — 按依赖关系拓扑排序, 无依赖的成员可并行。
 
@@ -691,26 +726,41 @@ class CrewOrchestrator:
         若某成员失败, 依赖它的后续成员仍会执行:
         失败信息通过 context["dependency_errors"] 传递 (dict[task_id, error_message]),
         不会因单点失败导致整个 DAG 阻塞。
+
+        线程安全: 并发执行时, 对 crew.members[i].status 和 crew.members[i].result
+        的读写必须通过 threading.Lock 保护。每个 CrewMember 使用独立锁,
+        或对就绪队列操作使用单一锁 + 原子状态更新, 避免数据竞争导致
+        依赖解析错误或结果丢失。
+
+        返回的 list[tuple[str, str, AgentResult]] 按完成顺序排列 (先完成的先出现),
+        每个 tuple 为 (agent_name, task_id, AgentResult),
+        此顺序即 execution_order (task_id 列表)。
         """
 
     # ── Aggregate: 结果聚合 ───────────────────────────
     def _aggregate_results(self, crew: AgentCrew,
-                           results: list[tuple[str, AgentResult]]) -> CrewResult:
+                           results: list[tuple[str, str, AgentResult]]) -> CrewResult:
         """
         汇总所有成员结果:
-        1. 遍历 results, 将每个 (agent_name, AgentResult) 拆分:
+        1. 遍历 results, 将每个 (agent_name, task_id, AgentResult) 拆分:
            - 若 AgentResult.success == True → 提取 final_answer
-           - 若 AgentResult.success == False → 记录到 failed_members 列表,
-             提取 error 信息作为上下文
+           - 若 AgentResult.success == False → 将 (agent_name, task_id) 记录到
+             failed_members 列表, 提取 error 信息作为上下文
         2. 将所有 member final_answer 和失败信息拼接为上下文
         3. 调用 LLM 生成统一的 mission_summary
-           (使用默认 temperature, 非 plan_temperature, 因为聚合任务是总结性工作)
+           使用 Config.llm_temperature (默认 0.7) 而非 plan_temperature (默认 0.4),
+           因为聚合任务是总结性工作, 需要一定的语言表达灵活性,
+           而 plan_temperature 追求的是分解的结构稳定性
         4. 计算 total_duration_ms (sum of all member durations) 和
            total token_usage (sum of all member token_usage)
-        5. 判定整体 success:
+        5. 从 results 中提取 task_id 列表构建 execution_order,
+           顺序与执行方法返回的 results 顺序一致
+           (SEQUENTIAL: members 列表顺序; PARALLEL: 提交顺序;
+            DAG: 拓扑完成顺序)
+        6. 判定整体 success:
            - True: failed_members 为空 (全部成员 success=True 且无异常)
            - False: failed_members 非空, mission_summary 包含已完成部分 + 失败说明
-        6. 构建并返回 CrewResult (含 failed_members 列表)
+        7. 构建并返回 CrewResult (含 failed_members 列表)
         """
 ```
 
@@ -885,10 +935,12 @@ class CrewTool(BaseTool):
         """
         mission = kwargs["mission"]
         strategy_str = kwargs.get("strategy", "sequential")
-        strategy = ExecutionStrategy(strategy_str)
         max_parallel = kwargs.get("max_parallel")
 
         try:
+            # 解析策略枚举 — 放入 try 块中以捕获非法 strategy 值 (如 LLM 幻觉产生的无效策略名),
+            # 避免 ValueError 绕过异常处理直接中断 ReAct 循环
+            strategy = ExecutionStrategy(strategy_str)
             crew_result = self._agent.launch_crew(
                 mission=mission,
                 strategy=strategy,

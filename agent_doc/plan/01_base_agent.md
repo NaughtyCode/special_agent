@@ -70,6 +70,10 @@ class AgentConfig:
     context_max_tokens: int | None = None   # 上下文窗口 Token 上限
     parent_agent: str | None = None         # 父 Agent 名称 (嵌套调用时设置)
     call_depth: int = 0                     # 调用栈深度 (防止无限递归)
+
+    # ── Crew 覆写 (可选, None = 使用全局 Config) ─────
+    crew_max_parallel_override: int | None = None   # 覆写 Crew 最大并行数
+    crew_strategy_override: str | None = None       # 覆写默认执行策略 ("sequential"/"parallel"/"dag")
 ```
 
 ### 2.3 核心方法
