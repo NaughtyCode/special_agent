@@ -252,6 +252,11 @@ class MyDomainAgent(BaseAgent):
         from agent.tools.file_tools import ReadFileTool, WriteFileTool
         self.tool_manager.register(ReadFileTool())
         self.tool_manager.register(WriteFileTool())
+        # ── Crew 编排 Tool (推荐) ──
+        # 注册 CrewTool 使此 Agent 可作为 CrewLeader 发起团队协作。
+        # 若此 Agent 不需要领导团队, 可移除此行。
+        from agent.tools.crew_tool import CrewTool
+        self.tool_manager.register(CrewTool(agent=self))
 
     def __init__(self, config: Config | None = None,
                  agent_config: AgentConfig | None = None):

@@ -148,8 +148,8 @@ CrewLeader (任意特化 Agent)
    │     └─ CrewOrchestrator.plan_crew()
    │           ├─ LLM 分解 mission → [SubTask₁, SubTask₂, ..., SubTaskₙ]
    │           ├─ 每个 SubTask 通过 AgentRegistry.match_agent() 匹配对应 Agent
-   │           └─ 组建 AgentCrew (含 N 个 CrewMember)
-   │               发布 CrewLifecycleEvent.PLANNED
+   │           ├─ 组建 AgentCrew (含 N 个 CrewMember, 设置 created_at)
+   │           └─ 发布 CrewLifecycleEvent.PLANNED
    │
    ├─ 3. EXECUTE: 调用 launch_crew(mission, strategy)
    │     └─ CrewOrchestrator.execute_crew(crew, strategy)

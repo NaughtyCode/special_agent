@@ -227,10 +227,13 @@ class AgentRegistry:
         """
 
     # ── 导出 ─────────────────────────────────────────
-    def list_agents(self) -> list[dict]:
+    def list_agents(self) -> list[AgentMeta]:
         """
-        返回所有注册 Agent 的描述列表 (用于 Prompt 构建):
-        [{"name": "CodeAgent", "description": "...", "tags": [...]}, ...]
+        返回所有注册 Agent 的元数据列表 (用于 Prompt 构建和 Crew 任务分解):
+        [AgentMeta(name="CodeAgent", description="...", tags=[...], agent_cls=CodeAgent), ...]
+
+        返回 AgentMeta 而非 dict 以保留 agent_cls 引用,
+        使 plan_crew() 可直接使用此列表进行 Agent 匹配和后续实例化。
         """
 
     def get_agent_tools_schema(self) -> list[dict]:
@@ -320,6 +323,8 @@ class AgentTool(BaseTool):
         }
         self._agent_name = agent_name
         self._registry = agent_registry
+        self.tags = agent_meta.tags                # 继承 Agent 的标签
+        self.requires_confirmation = False         # Agent 拉起默认无需确认 (由子 Agent 自行控制)
 
     def execute(self, **kwargs) -> ToolResult:
         """
@@ -510,6 +515,21 @@ class CrewInvalidStateError(Exception):
     """
     pass
 
+class CrewPlanError(Exception):
+    """
+    Crew 任务分解失败错误 — 当 plan_crew() 调用 LLM 分解 mission 失败时抛出。
+
+    典型场景:
+    - LLM 返回的 JSON 格式错误, 且已耗尽 crew_max_iterations 次重试
+    - LLM 返回的 SubTask 列表为空 (mission 无法分解)
+    - LLM 调用超时或返回不可恢复错误
+
+    携带 raw_llm_output 属性供调试, 包含 LLM 最后一次原始输出。
+    """
+    def __init__(self, message: str, raw_llm_output: str | None = None):
+        super().__init__(message)
+        self.raw_llm_output = raw_llm_output
+
 # ── CrewOrchestrator ──────────────────────────────
 
 class CrewOrchestrator:
@@ -568,6 +588,9 @@ class CrewOrchestrator:
         1. 构建分解 Prompt (含可用 Agent 列表与能力描述)
         2. LLM 分析 mission (使用 self.plan_temperature 温度),
            输出结构化子任务列表 (JSON)
+           - 若 LLM 输出无法解析为有效 JSON, 进行最多 crew_max_iterations 次重试,
+             每次重试将解析错误作为反馈发送给 LLM 要求修正格式
+           - 若全部重试耗尽仍失败, 抛出 CrewPlanError (含原始 LLM 输出供调试)
         3. 每个子任务通过 AgentRegistry.match_agent() 匹配最佳 Agent
         4. 构建 AgentCrew (含 CrewMember 列表)
         5. 设置 crew.created_at = time.time() (记录创建时间戳, 用于计算总耗时)
@@ -608,11 +631,21 @@ class CrewOrchestrator:
         """
         串行执行 — 按 members 列表顺序依次执行每个成员。
 
+        执行前校验: 每个 member.task 必须非 None, 否则抛出 ValueError
+        (task 为 None 表示 plan_crew 阶段未正确分配子任务)。
+
+        每个成员执行时, 将 SubTask 映射为 agent.run() 参数:
+        - agent.run(user_input=task.description, context=task.context)
+
         前一成员的结果 (final_answer) 自动作为后一成员的 task.context 传入,
-        确保信息在任务链中流动。适用于有强顺序依赖的任务链。
+        确保信息在任务链中流动。context 合并策略: 保留原有 task.context 的键,
+        新增 "previous_result" 键存储前一成员的 final_answer,
+        若键冲突则以新增的 "previous_result" 为准。
+
+        适用于有强顺序依赖的任务链。
 
         若任一成员失败, 默认继续执行后续成员 (不立即终止),
-        失败信息会传递给后续成员作为上下文参考。
+        失败信息会通过 context["previous_error"] 传递给后续成员作为上下文参考。
         """
 
     def _execute_parallel(self, crew: AgentCrew,
@@ -620,8 +653,15 @@ class CrewOrchestrator:
         """
         并行执行 — 并发执行所有成员 (受 max_parallel 限制)。
 
+        执行前校验: 每个 member.task 必须非 None, 否则抛出 ValueError。
+
+        每个成员执行时, 将 SubTask 映射为 agent.run() 参数:
+        - agent.run(user_input=task.description, context=task.context)
+        每个成员使用各自的 task.context (由 plan_crew 阶段设定),
+        成员之间不共享运行时 context (因为任务间无依赖),
+        但各自保留 plan 阶段分配的 task.context 数据。
+
         使用 concurrent.futures.ThreadPoolExecutor 实现并发控制。
-        每个成员独立执行, 不共享 context (因为任务间无依赖)。
         适用于成员间无依赖的独立子任务 (如同时搜索多个信息源)。
 
         返回结果按提交顺序排列, 与 members 列表顺序一致。
@@ -631,15 +671,25 @@ class CrewOrchestrator:
         """
         DAG 执行 — 按依赖关系拓扑排序, 无依赖的成员可并行。
 
+        执行前校验: 每个 member.task 必须非 None, 否则抛出 ValueError。
+
+        每个成员执行时, 将 SubTask 映射为 agent.run() 参数:
+        - agent.run(user_input=task.description, context=task.context)
+
         算法:
         1. 构建依赖图 (SubTask.dependencies → task_id → 被哪些 task 依赖)
         2. 找出所有入度为 0 的成员, 加入就绪队列
         3. 并发执行就绪队列中的所有成员
-        4. 每完成一个成员, 将其结果传递给所有依赖它的后续成员 (注入 context),
-           并将后续成员中所有依赖已满足的加入就绪队列
-        5. 重复步骤 3-4 直到所有成员完成
+        4. 每完成一个成员, 将其结果传递给所有依赖它的后续成员:
+           context 合并策略 — 保留原有 task.context 的键,
+           新增 "dependency_results" 键 (dict[task_id, final_answer]),
+           记录所有已完成的依赖任务结果, 供后续成员参考上游输出。
+           若键冲突则以新增键为准, 确保上游结果不会被静默丢弃。
+        5. 当某成员的所有依赖都已满足 (全部完成), 将其加入就绪队列
+        6. 重复步骤 3-5 直到所有成员完成
 
-        若某成员失败, 依赖它的后续成员仍会执行 (携带失败信息作为 context),
+        若某成员失败, 依赖它的后续成员仍会执行:
+        失败信息通过 context["dependency_errors"] 传递 (dict[task_id, error_message]),
         不会因单点失败导致整个 DAG 阻塞。
         """
 
@@ -770,6 +820,12 @@ class CrewTool(BaseTool):
     与 AgentTool (单个 Agent 拉起) 互补:
     - AgentTool: 拉起单个指定 Agent → Tool 名 = Agent 名
     - CrewTool:  组建并执行 Agent 团队 → Tool 名固定为 "launch_crew"
+
+    LLM 选择指南 (写入 system_prompt 的 Tool 使用说明):
+    - 使用 launch_<agent> (AgentTool): 任务明确属于单一领域 (如"写一段代码"→CodeAgent,
+      "查一下这个函数用法"→SearchAgent), 无需分解和协调
+    - 使用 launch_crew (CrewTool): 任务涉及多个领域或阶段 (如"实现一个完整的 API 系统:
+      需要代码+文档+测试"), 需要自动分解和协调多个 Agent
     """
 
     def __init__(self, agent: BaseAgent) -> None:
