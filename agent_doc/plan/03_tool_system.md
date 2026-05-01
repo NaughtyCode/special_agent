@@ -334,7 +334,28 @@ class AgentTool(BaseTool):
         3. 将 AgentResult 转换为 ToolResult:
            - success → output = agent_result.final_answer
            - failure → error = agent_result.error
+        4. 异常时捕获并包装为失败 ToolResult, 避免中断 ReAct 循环
+           (与 CrewTool.execute() 保持一致的错误处理策略)
         """
+        try:
+            task = kwargs["task"]
+            context = kwargs.get("context")
+            agent_result = self._registry.launch(self._agent_name, task, context)
+            return ToolResult(
+                success=agent_result.success,
+                output=agent_result.final_answer,
+                data=agent_result,
+                tool_name=self.name,
+                duration_ms=agent_result.total_duration_ms,
+                error=str(agent_result.error) if agent_result.error else None
+            )
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                output=f"Agent '{self._agent_name}' 执行失败: {e}",
+                error=str(e),
+                tool_name=self.name
+            )
 ```
 
 ## 7. 内置 Tool 列表
@@ -604,9 +625,17 @@ class CrewOrchestrator:
              每次重试将解析错误作为反馈发送给 LLM 要求修正格式
            - 若全部重试耗尽仍失败, 抛出 CrewPlanError (含原始 LLM 输出供调试)
         3. 每个子任务通过 AgentRegistry.match_agent() 匹配最佳 Agent
-        4. 构建 AgentCrew (含 CrewMember 列表)
-        5. 设置 crew.created_at = time.time() (记录创建时间戳, 用于计算总耗时)
-        6. 发布 CrewLifecycleEvent.PLANNED (携带 CrewEvent 负载)
+           - 若某个 SubTask 匹配失败 (无 Agent 满足 required_tags 或匹配得分低于阈值),
+             抛出 CrewPlanError(f"no agent matched for subtask '{task_id}'"),
+             避免构建出 agent_cls=None 的无效 CrewMember
+        4. 校验依赖完整性:
+           - 收集所有 SubTask.task_id → 构建合法 task_id 集合
+           - 遍历每个 SubTask.dependencies, 检查其中每个 task_id 是否存在于集合中
+           - 若引用了不存在的 task_id, 抛出 CrewPlanError(f"dependency '{dep}' not found")
+           - 若存在循环依赖 (DFS 检测), 抛出 CrewPlanError("circular dependency detected")
+        5. 构建 AgentCrew (含 CrewMember 列表)
+        6. 设置 crew.created_at = time.time() (记录创建时间戳, 用于计算总耗时)
+        7. 发布 CrewLifecycleEvent.PLANNED (携带 CrewEvent 负载)
 
         返回已组建但尚未执行的 AgentCrew (status=ASSEMBLED)。
 
@@ -622,31 +651,45 @@ class CrewOrchestrator:
         """
         按指定策略执行 Crew。
 
-        前置条件: crew.status 必须为 ASSEMBLED, 否则抛出 CrewInvalidStateError
-        (防止重复执行同一 Crew 或执行未完成规划的 Crew)。
+        前置条件:
+        - crew.status 必须为 ASSEMBLED, 否则抛出 CrewInvalidStateError
+        - crew.members 必须非空, 否则抛出 ValueError("crew has no members to execute")
+          (空列表表示 plan_crew 未正确分解 mission, 或 LLM 返回了空 SubTask 列表)
 
         内部流程:
         1. 校验 crew.status == "ASSEMBLED", 不满足则抛出 CrewInvalidStateError
-        2. 设置 crew.status = "RUNNING"
-        3. 发布 CrewLifecycleEvent.STARTED (携带 CrewEvent 负载, 含 crew_id 和 strategy)
-        4. 根据 strategy 分发:
+        2. 校验 len(crew.members) > 0, 不满足则抛出 ValueError
+        3. 设置 crew.status = "RUNNING"
+        4. 发布 CrewLifecycleEvent.STARTED (携带 CrewEvent 负载, 含 crew_id 和 strategy)
+        5. 根据 strategy 分发:
            - SEQUENTIAL → _execute_sequential(crew)
            - PARALLEL   → _execute_parallel(crew, max_parallel or self.max_parallel)
              (max_parallel 为 None 时回退到 self.max_parallel, 即 Config.crew_max_parallel)
            - DAG        → _execute_dag(crew)
-        5. 在各执行方法内部, 每个成员执行: AgentPool.acquire → agent.run(task) → AgentPool.release
+        6. 在各执行方法内部, 每个成员执行: AgentPool.acquire → agent.run(task) → AgentPool.release
            每个成员必须使用 try/finally 确保 AgentPool.release 在异常时也被调用,
            避免 AgentPool 实例泄漏:
            ```
-           member.agent_instance = agent_pool.acquire(member.agent_name, ...)
+           # AgentPool.acquire 第二参数为工厂函数 (零参数 callable), 用于按需创建新实例;
+           # 工厂内部需传递 Agent 类所需的全部构造参数 (name/description/config/agent_config),
+           # 这些参数可从 CrewLeader 继承 (如 config) 或从 CrewMember 元数据获取
+           member.agent_instance = agent_pool.acquire(member.agent_name,
+               agent_factory=lambda: member.agent_cls(
+                   name=member.agent_name,
+                   description=agent_registry.get_agent_meta(member.agent_name).description))
            try:
                member.status = "RUNNING"
                member.started_at = time.time()
-               member.result = agent.run(task.description, task.context)
+               member.result = member.agent_instance.run(
+                   member.task.description, member.task.context)
                member.status = "DONE"
            except Exception as e:
                member.status = "FAILED"
-               member.result = AgentResult(success=False, final_answer=str(e), ...)
+               member.result = AgentResult(
+                   success=False, final_answer=str(e),
+                   iterations=[], token_usage=TokenUsage(),
+                   total_duration_ms=0, finish_reason=FinishReason.ERROR,
+                   error=ToolExecutionError(str(e)))
            finally:
                member.completed_at = time.time()
                agent_pool.release(member.agent_instance)
@@ -654,10 +697,10 @@ class CrewOrchestrator:
            (每个成员执行时发布 MEMBER_STARTED / MEMBER_COMPLETED / MEMBER_FAILED,
             MEMBER_COMPLETED 携带 duration_ms=completed_at-started_at,
             MEMBER_FAILED 携带 error_message)
-        6. 汇总所有成员结果 → 调用 _aggregate_results
-        7. 设置 crew.status = "COMPLETED" (全部成功) 或 "FAILED" (有失败成员)
-        8. 发布 CrewLifecycleEvent.COMPLETED 或 FAILED (携带 CrewEvent 负载)
-        9. 返回 CrewResult
+        7. 汇总所有成员结果 → 调用 _aggregate_results
+        8. 设置 crew.status = "COMPLETED" (全部成功) 或 "FAILED" (有失败成员)
+        9. 发布 CrewLifecycleEvent.COMPLETED 或 FAILED (携带 CrewEvent 负载)
+        10. 返回 CrewResult
         """
 
     def _execute_sequential(self, crew: AgentCrew) -> list[tuple[str, str, AgentResult]]:
@@ -672,6 +715,7 @@ class CrewOrchestrator:
 
         首个成员使用 plan_crew 阶段分配的原始 task.context (无 previous_result),
         后续每个成员执行前, 将前一成员的结果合并入 context:
+        - 若 task.context 为 None, 先初始化为空 dict {}
         - context["previous_result"] = 前一成员的 final_answer
         - context["previous_error"] = 前一成员的错误信息 (如有)
 
@@ -730,8 +774,8 @@ class CrewOrchestrator:
         3. 找出所有入度为 0 的成员, 加入就绪队列
         4. 并发执行就绪队列中的所有成员
         5. 每完成一个成员, 将其结果传递给所有依赖它的后续成员:
-           context 合并策略 — 保留原有 task.context 的键,
-           新增 "dependency_results" 键 (dict[task_id, final_answer]),
+           context 合并策略 — 若 task.context 为 None, 先初始化为空 dict {};
+           保留原有键, 新增 "dependency_results" 键 (dict[task_id, final_answer]),
            记录所有已完成的依赖任务结果, 供后续成员参考上游输出。
            若键冲突则以新增键为准, 确保上游结果不会被静默丢弃。
         6. 当某成员的所有依赖都已满足 (全部完成), 将其加入就绪队列
@@ -741,10 +785,14 @@ class CrewOrchestrator:
         失败信息通过 context["dependency_errors"] 传递 (dict[task_id, error_message]),
         不会因单点失败导致整个 DAG 阻塞。
 
-        线程安全: 并发执行时, 对 crew.members[i].status 和 crew.members[i].result
-        的读写必须通过 threading.Lock 保护。每个 CrewMember 使用独立锁,
-        或对就绪队列操作使用单一锁 + 原子状态更新, 避免数据竞争导致
-        依赖解析错误或结果丢失。
+        线程安全: 并发执行时, 以下字段的读写必须通过 threading.Lock 保护:
+        - crew.members[i].status — 防止两个线程同时判定依赖满足并重复执行
+        - crew.members[i].result — 防止并发写入导致数据损坏
+        - crew.members[i].task.context — 当多个上游成员同时完成时,
+          它们会并发地向同一个下游成员的 context 中合并 dependency_results,
+          若不加锁保护, context["dependency_results"] 字典可能被部分覆盖或损坏
+        实现建议: 每个 CrewMember 使用独立 threading.Lock, 或对 context 合并操作
+        使用 copy-on-write (先深拷贝原 context, 修改副本, 再原子赋值)。
 
         返回的 list[tuple[str, str, AgentResult]] 按完成顺序排列 (先完成的先出现),
         每个 tuple 为 (agent_name, task_id, AgentResult),
@@ -955,11 +1003,13 @@ class CrewTool(BaseTool):
            - failure → error = 失败描述
         4. 异常时捕获并包装为失败 ToolResult, 避免中断 ReAct 循环
         """
-        mission = kwargs["mission"]
-        strategy_str = kwargs.get("strategy", "sequential")
-        max_parallel = kwargs.get("max_parallel")
-
         try:
+            # 所有参数提取和校验均放入 try 块, 确保任何异常 (含 KeyError/ValueError)
+            # 都被捕获并转换为失败 ToolResult, 避免中断 ReAct 循环
+            mission = kwargs["mission"]  # 若缺失则抛出 KeyError, 由 except 捕获
+            strategy_str = kwargs.get("strategy", "sequential")
+            max_parallel = kwargs.get("max_parallel")
+
             # 解析策略枚举 — 放入 try 块中以捕获非法 strategy 值 (如 LLM 幻觉产生的无效策略名),
             # 避免 ValueError 绕过异常处理直接中断 ReAct 循环
             strategy = ExecutionStrategy(strategy_str)

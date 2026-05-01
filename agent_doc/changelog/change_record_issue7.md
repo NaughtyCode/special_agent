@@ -6,13 +6,13 @@
 |------|------|
 | 修改编号 | issue7 |
 | 修改日期 | 2026-05-01 |
-| 修改类型 | Crew 机制深度审查 (六轮) — 补全缺失定义、修复跨文档不一致、增强注释与错误处理、修复生命周期管理缺失、修复类型不一致与执行细节缺失、修复运行时逻辑错误与资源管理缺陷、修复类型系统歧义与流程图逻辑错误 |
+| 修改类型 | Crew 机制深度审查 (七轮) — 补全缺失定义、修复跨文档不一致、增强注释与错误处理、修复生命周期管理缺失、修复类型不一致与执行细节缺失、修复运行时逻辑错误与资源管理缺陷、修复类型系统歧义与流程图逻辑错误、修复代码示例错误与边界条件校验缺失 |
 | 关联文档 | `agent_doc/plan/` (00, 01, 03, 06, 07, 08) |
 | 修改人 | SpecialArchAgent |
 
 ## 修改概述
 
-对 Issue #6 新增的 Crew 团队编排机制进行六轮反复深度审查。
+对 Issue #6 新增的 Crew 团队编排机制进行七轮反复深度审查。
 
 **第一轮**: 修复缺失的类定义、配置字段缺失、方法参数传递错误、事件定义格式错误、事件发布重复、依赖关系遗漏等问题。
 
@@ -25,6 +25,8 @@
 **第五轮**: 修复运行时逻辑错误 (strategy 解析未捕获异常)、线程安全文档缺失、execution_order 填充逻辑缺失、资源管理缺陷 (AgentPool acquire/release 无 finally)、AgentConfig Crew 覆写字段缺失、CrewMember 计时字段缺失、空 mission 校验缺失、PARALLEL 策略依赖警告缺失、聚合方法步骤编号重复等问题。
 
 **第六轮**: 修复类型系统歧义 (member_results/failed_members 使用非唯一 agent_name 而非 task_id)、编排流程图逻辑错误 (form_crew + launch_crew 冗余调用)、DAG 循环依赖检测缺失、max_parallel 回退逻辑未文档化、CrewEvent 类型不精确、launch_crew 参数覆写解析顺序缺失等问题。
+
+**第七轮**: 修复 execute_crew 代码示例变量名错误 (agent→member.agent_instance, task→member.task)、AgentPool factory 参数未文档化、CrewTool.execute() KeyError 未捕获、plan_crew 依赖引用校验缺失/Agent 匹配校验缺失、execute_crew 空成员列表未处理、DAG context 线程安全覆盖不全、task.context=None 时合并崩溃、AgentTool 与 CrewTool 错误处理不一致等问题。
 
 ## 文件变更清单
 
@@ -831,7 +833,8 @@ member.completed_at = time.time()  # 在 finally 块中
 | 第四轮 | 9 | 类型不一致、属性缺失、执行细节缺失、错误处理缺失、示例不完整、选择指南 |
 | 第五轮 | 11 | 运行时逻辑错误、线程安全、资源管理缺陷、配置缺失、数据模型缺失、文档精确性 |
 | 第六轮 | 11 | 类型歧义、流程图逻辑错误、边界条件缺失、文档缺口、示例同步 |
-| **总计** | **59** | |
+| 第七轮 | 10 | 代码示例错误、边界校验缺失、线程安全覆盖不全、错误处理不一致 |
+| **总计** | **69** | |
 
 ### 第六轮影响分析
 
@@ -839,3 +842,119 @@ member.completed_at = time.time()  # 在 finally 块中
 - **流程图正确性**: 问题 45 修复了一个会误导所有实现者的根本性错误 — 如果按原流程图实现, form_crew 会被调用两次, 第一次的结果被静默丢弃, 造成资源浪费和潜在的状态不一致。
 - **运行时健壮性**: 问题 46 (循环依赖检测) 防止了 LLM 输出错误导致的静默死锁, 将不可恢复的错误转化为明确的 CrewPlanError 异常。
 - **实现完备性**: 问题 47-51 填补了文档中的最终细节缺口, 确保实现者无需猜测任何边界行为。
+
+---
+
+## 第七轮深度审查 (补充修复)
+
+在对 Crew 机制进行第七次反复检查后，发现以下额外问题。本轮重点关注代码示例的正确性、边界条件校验的完整性、以及异常处理的一致性。
+
+### 追加文件变更清单
+
+| 序号 | 文件路径 | 变更说明 |
+|------|----------|----------|
+| G1 | `agent_doc/plan/03_tool_system.md` | execute_crew 代码示例修复: agent→member.agent_instance, task→member.task; AgentPool factory 参数文档化; AgentResult 失败默认值显式化; CrewTool.execute() 将 mission 提取移入 try 块; plan_crew 新增 Agent 匹配校验 + 依赖引用校验; execute_crew 新增空成员列表校验 + 步骤重新编号; DAG 线程安全文档扩展覆盖 task.context; _execute_sequential/_execute_dag 补充 task.context=None 处理; AgentTool.execute() 新增 try/except (与 CrewTool 一致) |
+
+### 追加问题详情
+
+#### 问题 57: execute_crew 代码示例变量名错误
+
+**发现**: `execute_crew()` 步骤 5 的 per-member 执行代码示例中:
+- 第 1 行将 acquire 返回值赋值给 `member.agent_instance`
+- 第 4 行却使用 `agent.run(...)` — 变量 `agent` 未定义
+- `task.description` 和 `task.context` — 变量 `task` 未定义
+
+正确应为 `member.agent_instance.run(member.task.description, member.task.context)`。
+
+若实现者直接复制此代码, 将导致 `NameError`, Agent 实例虽已获取但从未被调用, 所有 CrewMember 结果为空。
+
+**修复**: 代码示例全部修正为正确的变量引用路径, 并补充 `AgentPool.acquire` 的 `agent_factory` 参数文档。
+
+#### 问题 58: AgentResult 失败构造的默认值隐藏
+
+**发现**: 代码示例中 `AgentResult(success=False, final_answer=str(e), ...)` — `...` 隐藏了其他必填字段 (`iterations`, `token_usage`, `total_duration_ms`, `finish_reason`, `error`)。实现者可能遗漏这些字段, 导致返回不完整的 AgentResult。
+
+**修复**: 将 `...` 替换为显式的默认值构造:
+```python
+AgentResult(success=False, final_answer=str(e),
+    iterations=[], token_usage=TokenUsage(),
+    total_duration_ms=0, finish_reason=FinishReason.ERROR,
+    error=ToolExecutionError(str(e)))
+```
+
+#### 问题 59: CrewTool.execute() 中 mission 提取未受异常保护
+
+**发现**: `mission = kwargs["mission"]` 位于 try/except 块之前。若 LLM 因 Function Calling schema 被忽略或其他原因未传递 `mission` 参数, `KeyError` 向上传播, 不会被 try/except 捕获, 导致 ReAct 循环崩溃而非优雅降级。
+
+**修复**: 将 `mission = kwargs["mission"]` 及所有参数提取移入 try 块内部, 确保任何参数错误都被捕获并转换为失败 ToolResult。
+
+#### 问题 60: plan_crew 缺少依赖引用完整性校验
+
+**发现**: `plan_crew()` 将 LLM 返回的 JSON 解析为 SubTask 列表后, 直接构建 AgentCrew。但未校验:
+- SubTask.dependencies 中引用的 task_id 是否存在于当前 SubTask 列表中
+- 是否存在循环依赖 (A→B→A)
+
+若 LLM 幻觉导致依赖引用不存在的 task_id, 或产生循环依赖, DAG 执行阶段会静默失败或无限循环。
+
+**修复**: `plan_crew()` 在构建 AgentCrew 前新增步骤 4 "校验依赖完整性": 收集合法 task_id 集合 → 遍历检查每个 dependency 引用 → 不合法则抛出 CrewPlanError; DFS 检测循环依赖 → 存在环则抛出 CrewPlanError。
+
+#### 问题 61: plan_crew 缺少 Agent 匹配成功校验
+
+**发现**: `plan_crew()` 步骤 3 调用 `AgentRegistry.match_agent()` 但未校验匹配是否成功。若某 SubTask 的 `required_tags` 无任何 Agent 满足, `CrewMember.agent_cls` 将保持 None, 导致执行阶段 `agent_factory` 创建失败 (NoneType is not callable)。
+
+**修复**: 步骤 3 补充: "若匹配失败 (无 Agent 满足 required_tags 或匹配得分低于阈值), 抛出 CrewPlanError"。
+
+#### 问题 62: execute_crew 缺少空成员列表处理
+
+**发现**: `execute_crew()` 未校验 `crew.members` 是否为空列表。若 `plan_crew()` 返回空 SubTask 列表 (LLM 输出 `[]` 且 JSON 解析成功), `execute_crew()` 将调用执行方法处理空列表:
+- `_execute_sequential`: 空循环, 返回空 results
+- `_execute_parallel`: ThreadPoolExecutor 无任务提交
+- `_execute_dag`: 依赖图为空, 入度为 0 的节点集合为空 → 静默退出
+
+空 Crew 应被明确拒绝而非静默 "成功"。
+
+**修复**: `execute_crew()` 新增前置条件: `crew.members` 必须非空, 否则抛出 `ValueError("crew has no members to execute")`。
+
+#### 问题 63: task.context 为 None 时合并操作崩溃
+
+**发现**: `SubTask.context` 默认值为 `None`。在 `_execute_sequential` 中, 从第二个成员开始执行 `context["previous_result"] = ...` 合并操作 — 若 `task.context` 为 None, 对 None 做 item assignment 抛出 `TypeError`。
+
+同样, `_execute_dag` 中合并 `dependency_results` 到下游成员 context 时也存在相同问题。
+
+**修复**: 两个执行方法的 context 合并文档均补充: "若 task.context 为 None, 先初始化为空 dict {}"。
+
+#### 问题 64: DAG 线程安全文档未覆盖 context 字段
+
+**发现**: `_execute_dag` 线程安全文档仅覆盖 `crew.members[i].status` 和 `crew.members[i].result`。但在并发执行中, 当多个上游成员同时完成, 它们会并发地向同一个下游成员的 `task.context["dependency_results"]` 字典写入数据 — 这是一个明确的数据竞争点, 可能导致字典部分更新或损坏。
+
+**修复**: 线程安全文档扩展覆盖 `crew.members[i].task.context`, 并补充 copy-on-write 实现建议。
+
+#### 问题 65: AgentTool.execute() 与 CrewTool.execute() 错误处理不一致
+
+**发现**: `CrewTool.execute()` 使用 try/except 包裹所有逻辑, 确保异常被捕获并转换为失败 ToolResult。但 `AgentTool.execute()` 直接调用 `agent_registry.launch()` 并将结果转换为 ToolResult, 无任何异常处理。若 AgentPool 耗尽或 Agent 执行超时, 异常直接向上传播到 ReAct 循环, 导致不一致的错误处理行为。
+
+**修复**: `AgentTool.execute()` 新增 try/except 块, 与 `CrewTool.execute()` 保持一致的错误处理策略。
+
+#### 问题 66: AgentPool.acquire 的 agent_factory 参数未文档化
+
+**发现**: 代码示例中 `agent_pool.acquire(member.agent_name, ...)` 的 `...` 隐藏了 `agent_factory` 参数。`AgentPool.acquire` 签名为 `acquire(agent_name, agent_factory: Callable[[], BaseAgent])`, 其中 agent_factory 是零参数工厂函数, 需包含 Agent 构造所需的所有参数 (name, description, config 等)。实现者可能不清楚如何正确构造此工厂。
+
+**修复**: 代码示例补充注释说明 agent_factory 的契约和构造方式, 并在 lambda 中包含从 agent_registry 获取 description 的完整示例。
+
+### 第七轮问题修复统计
+
+| 类别 | 数量 | 说明 |
+|------|------|------|
+| 代码示例错误 | 3 | 变量名错误、默认值隐藏、factory 参数未文档化 |
+| 异常处理缺失/不一致 | 2 | CrewTool KeyError、AgentTool 无 try/except |
+| 边界校验缺失 | 3 | 依赖引用校验、Agent 匹配校验、空成员列表 |
+| 线程安全覆盖不全 | 1 | DAG context 合并未加锁说明 |
+| 空指针 (None) 处理 | 1 | task.context=None 时合并崩溃 |
+| **第七轮合计** | **10** | |
+
+### 第七轮影响分析
+
+- **代码可复现性**: 问题 57-58 的修复使代码示例可直接被实现者复制使用, 不再包含未定义变量和隐藏的必填字段。
+- **异常鲁棒性**: 问题 59/65 确保所有 Tool 执行路径的错误处理一致 — 无论是单个 Agent 拉起还是 Crew 编排, 异常都被捕获并优雅降级, 而非中断 ReAct 循环。
+- **边界完备性**: 问题 60-62 补全了 plan→execute 链路上的 3 个关键校验点 (依赖完整性/匹配有效性/成员非空), 确保非法状态在最早的阶段被检测和拒绝。
+- **并发安全**: 问题 64 将 context 字段纳入线程安全保护范围, 防止 DAG 并发执行时出现数据竞争导致的结果损坏。
