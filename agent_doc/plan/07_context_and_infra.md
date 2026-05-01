@@ -177,20 +177,24 @@ class Config:
     """
     全局配置管理 — 从环境变量读取所有配置。
 
-    所有字段名去除厂商前缀, 使用 provider-agnostic 命名。
-    兼容旧的 DEEPSEEK_* 环境变量 (LLM_* 未设置时回退)。
+    所有 LLM 相关字段使用 ANTHROPIC_* 命名体系的环境变量。
+    API_TIMEOUT_MS 以毫秒为单位, 内部自动转换为秒。
     """
 
     # ── LLM Provider ────────────────────────────────
-    llm_api_key: str                        # API 密钥 (环境变量: LLM_API_KEY)
-    llm_base_url: str = "https://api.deepseek.com/anthropic"  # API 地址 (LLM_BASE_URL)
-    llm_model: str = "deepseek-v4-pro"        # 默认模型 (LLM_MODEL)
-    llm_max_tokens: int = 4096              # 最大生成 Token (LLM_MAX_TOKENS)
-    llm_temperature: float = 0.7            # 采样温度 (LLM_TEMPERATURE)
-    llm_timeout: float = 60.0               # 请求超时秒 (LLM_TIMEOUT)
-    llm_max_retries: int = 3                # 最大重试次数 (LLM_MAX_RETRIES)
-    llm_retry_base_delay: float = 1.0       # 重试基础延迟秒 (LLM_BASE_DELAY)
-    llm_retry_max_delay: float = 60.0       # 重试最大延迟秒 (LLM_MAX_DELAY)
+    llm_api_key: str                        # API 认证令牌 (环境变量: ANTHROPIC_AUTH_TOKEN, 必需)
+    llm_base_url: str = "https://api.deepseek.com/anthropic"  # API 基础地址 (ANTHROPIC_BASE_URL)
+    llm_model: str = "deepseek-v4-pro"        # 默认模型名称 (ANTHROPIC_MODEL)
+    llm_small_fast_model: str | None = None   # 小型快速模型 (ANTHROPIC_SMALL_FAST_MODEL, 可选,
+                                               # 用于简单任务以降低延迟和 Token 消耗)
+    llm_custom_model_option: str | None = None  # 自定义模型选项 (ANTHROPIC_CUSTOM_MODEL_OPTION, 可选,
+                                                 # JSON 字符串格式, 合并到请求体中)
+    llm_max_tokens: int = 4096              # 最大生成 Token 数 (每次请求的 max_tokens 默认值)
+    llm_temperature: float = 0.7            # 采样温度 0-2 (每次请求的 temperature 默认值)
+    llm_timeout: float = 60.0               # 请求超时秒数 (由 API_TIMEOUT_MS 环境变量 / 1000 转换)
+    llm_max_retries: int = 3                # 最大重试次数 (可重试错误的重试上限)
+    llm_retry_base_delay: float = 1.0       # 重试基础延迟秒 (指数退避的起始值)
+    llm_retry_max_delay: float = 60.0       # 重试最大延迟秒 (指数退避的上限)
 
     # ── Agent ───────────────────────────────────────
     agent_max_iterations: int = 10          # ReAct 最大迭代次数 (AGENT_MAX_ITERATIONS)
@@ -231,16 +235,29 @@ class Config:
     @classmethod
     def from_env(cls) -> Config:
         """
-        从环境变量加载配置。
-        优先级: LLM_* 环境变量 > DEEPSEEK_* 环境变量 (兼容) > 默认值
+        从环境变量加载所有配置。
+
+        LLM 相关环境变量 (ANTHROPIC_* 命名体系):
+        - ANTHROPIC_AUTH_TOKEN → llm_api_key (必需, 否则 validate() 失败)
+        - ANTHROPIC_BASE_URL → llm_base_url (默认 https://api.deepseek.com/anthropic)
+        - ANTHROPIC_MODEL → llm_model (默认 deepseek-v4-pro)
+        - ANTHROPIC_SMALL_FAST_MODEL → llm_small_fast_model (可选)
+        - ANTHROPIC_CUSTOM_MODEL_OPTION → llm_custom_model_option (可选, JSON 格式)
+        - API_TIMEOUT_MS → llm_timeout (毫秒转秒: int(API_TIMEOUT_MS) / 1000)
+
+        对于 llm_custom_model_option, 若值为有效 JSON 字符串则解析为 dict,
+        否则以原始字符串存储 (由 Provider 层决定如何使用)。
         """
 
     def validate(self) -> None:
         """
         校验必要配置项:
-        - llm_api_key 不为空
-        - llm_base_url 格式合法
-        - 数值范围合理 (temperature 0-2, max_tokens > 0, timeout > 0)
+        - llm_api_key (来自 ANTHROPIC_AUTH_TOKEN) 不为空
+        - llm_base_url (来自 ANTHROPIC_BASE_URL) 格式合法 (必须是 http/https URL)
+        - llm_timeout (由 API_TIMEOUT_MS 转换) > 0
+        - llm_temperature 在 0-2 范围内
+        - llm_max_tokens > 0
+        - 若 llm_custom_model_option 非空且为 JSON 字符串, 校验其为合法 JSON
         抛出 ConfigValidationError 若校验失败。
         """
 
@@ -350,7 +367,7 @@ SpecialAgent/
 │   │   └── event_bus.py               # EventBus
 │   └── infra/
 │       ├── __init__.py
-│       ├── config.py                  # Config (provider-agnostic, 兼容 DEEPSEEK_*)
+│       ├── config.py                  # Config (ANTHROPIC_* 环境变量, API_TIMEOUT_MS)
 │       └── logger.py                  # AgentLogger
 ├── tests/
 │   ├── test_base_agent.py

@@ -79,14 +79,13 @@ class OpenAICompatProvider:
     - 任意 OpenAI-compatible 代理 (如 packyapi 等)
     - 本地模型 (如 Ollama, vLLM)
 
-    配置通过环境变量注入 (provider-agnostic 命名):
-    - LLM_API_KEY
-    - LLM_BASE_URL
-    - LLM_MODEL
-    - LLM_MAX_TOKENS
-    - LLM_TEMPERATURE
-    - LLM_TIMEOUT
-    - LLM_MAX_RETRIES
+    配置通过环境变量注入 (ANTHROPIC_* 命名体系):
+    - ANTHROPIC_AUTH_TOKEN      — API 认证令牌 (必需)
+    - ANTHROPIC_BASE_URL         — API 基础地址
+    - ANTHROPIC_MODEL            — 默认模型名称
+    - ANTHROPIC_SMALL_FAST_MODEL — 小型快速模型 (用于简单任务, 可选)
+    - ANTHROPIC_CUSTOM_MODEL_OPTION — 自定义模型选项 (JSON 字符串, 可选)
+    - API_TIMEOUT_MS             — API 请求超时时间 (毫秒)
     """
 
     # ── 构造 ─────────────────────────────────────────
@@ -94,23 +93,30 @@ class OpenAICompatProvider:
                  api_key: str,
                  base_url: str,
                  model: str | None = None,
+                 small_fast_model: str | None = None,
+                 custom_model_option: str | None = None,
                  max_tokens: int = 4096,
                  temperature: float = 0.7,
                  timeout: float = 60.0,
                  max_retries: int = 3,
                  extra_headers: dict[str, str] | None = None) -> None:
         """
-        初始化 Provider。
+        初始化 OpenAI-compatible Provider。
 
         参数:
-            api_key: API 密钥
-            base_url: API 基础地址 (如 "https://api.deepseek.com")
-            model: 默认模型名称
-            max_tokens: 最大生成 Token 数
-            temperature: 采样温度 (0-2)
-            timeout: 请求超时 (秒)
-            max_retries: 可重试错误的最大重试次数
-            extra_headers: 额外的 HTTP 头
+            api_key: API 认证令牌 (来自 ANTHROPIC_AUTH_TOKEN 环境变量)
+            base_url: API 基础地址 (来自 ANTHROPIC_BASE_URL 环境变量,
+                      如 "https://api.deepseek.com/anthropic")
+            model: 默认模型名称 (来自 ANTHROPIC_MODEL 环境变量)
+            small_fast_model: 小型快速模型名称 (来自 ANTHROPIC_SMALL_FAST_MODEL 环境变量,
+                              用于简单任务以减少延迟和 Token 消耗, 可选)
+            custom_model_option: 自定义模型选项 (来自 ANTHROPIC_CUSTOM_MODEL_OPTION 环境变量,
+                                 JSON 字符串格式, 用于传递模型特定参数, 可选)
+            max_tokens: 最大生成 Token 数 (默认 4096)
+            temperature: 采样温度 0-2 (默认 0.7)
+            timeout: 请求超时秒数 (由 API_TIMEOUT_MS 环境变量转换而来, 默认 60.0)
+            max_retries: 可重试错误的最大重试次数 (默认 3)
+            extra_headers: 额外的 HTTP 请求头 (用于自定义认证或追踪, 可选)
         """
 
     # ── 重试与错误处理 ────────────────────────────────
@@ -203,23 +209,28 @@ class LLMClient:
         """重置 Token 用量计数。"""
 ```
 
-## 5. 环境变量配置 (Provider-Agnostic)
+## 5. 环境变量配置 (ANTHROPIC_* 命名体系)
+
+所有 LLM API 相关配置通过以下环境变量注入, 遵循 ANTHROPIC_* 命名规范:
 
 | 环境变量 | 说明 | 默认值 |
 |----------|------|--------|
-| `LLM_API_KEY` | API 密钥 (必需) | 无, 必须设置 |
-| `LLM_BASE_URL` | API 基础地址 | `https://api.deepseek.com` |
-| `LLM_MODEL` | 默认模型名称 | `deepseek-v4-pro` |
-| `LLM_MAX_TOKENS` | 最大生成 Token 数 | `4096` |
-| `LLM_TEMPERATURE` | 采样温度 (0-2) | `0.7` |
-| `LLM_TIMEOUT` | 请求超时 (秒) | `60` |
-| `LLM_MAX_RETRIES` | 最大重试次数 | `3` |
-| `LLM_BASE_DELAY` | 重试基础延迟 (秒) | `1.0` |
-| `LLM_MAX_DELAY` | 重试最大延迟 (秒) | `60.0` |
+| `ANTHROPIC_AUTH_TOKEN` | API 认证令牌 (必需) | 无, 必须设置 |
+| `ANTHROPIC_BASE_URL` | API 基础地址 | `https://api.deepseek.com/anthropic` |
+| `ANTHROPIC_MODEL` | 默认模型名称 | `deepseek-v4-pro` |
+| `ANTHROPIC_SMALL_FAST_MODEL` | 小型快速模型 (用于简单任务) | 无 (可选) |
+| `ANTHROPIC_CUSTOM_MODEL_OPTION` | 自定义模型选项 (JSON 字符串) | 无 (可选) |
+| `API_TIMEOUT_MS` | API 请求超时 (毫秒) | `60000` |
 
-命名从 `DEEPSEEK_*` 改为 `LLM_*`，去除对具体厂商的绑定，提高配置的普适性。
+环境变量命名使用 ANTHROPIC_* 前缀, 与 Claude Code 生态保持一致。
+框架内部将 API_TIMEOUT_MS (毫秒) 转换为秒用于 httpx 客户端。
 
-为兼容旧项目，框架同时支持检测 `DEEPSEEK_*` 前缀的环境变量（若 `LLM_*` 未设置则回退）。
+`ANTHROPIC_SMALL_FAST_MODEL` 用于低复杂度任务 (如简单分类、摘要),
+Agent 可根据任务类型自动选择 small_fast_model 或默认 model。
+
+`ANTHROPIC_CUSTOM_MODEL_OPTION` 用于传递模型特定的高级参数 (如 top_k, top_p, 
+response_format 等), 以 JSON 字符串格式提供, 在请求时合并到请求体中。
+"""
 
 ## 6. 数据模型
 
@@ -275,14 +286,14 @@ class TokenTracker:
 ### 7.1 基本 Chat Completion
 
 ```json
-POST {LLM_BASE_URL}/v1/chat/completions
+POST {ANTHROPIC_BASE_URL}/v1/chat/completions
 Headers:
-  Authorization: Bearer {LLM_API_KEY}
+  Authorization: Bearer {ANTHROPIC_AUTH_TOKEN}
   Content-Type: application/json
 
 Body:
 {
-  "model": "{LLM_MODEL}",
+  "model": "{ANTHROPIC_MODEL}",
   "messages": [
     {"role": "system", "content": "..."},
     {"role": "user", "content": "..."}
@@ -297,7 +308,7 @@ Body:
 
 ```json
 {
-  "model": "{LLM_MODEL}",
+  "model": "{ANTHROPIC_MODEL}",
   "messages": [...],
   "tools": [
     {
@@ -347,12 +358,15 @@ class LLMContentFilterError(LLMError):
 ## 9. 使用示例
 
 ```python
-# 初始化: 自动从环境变量读取配置
+# 初始化: 自动从 ANTHROPIC_* 环境变量读取配置
 config = Config.from_env()
 provider = OpenAICompatProvider(
-    api_key=config.llm_api_key,
-    base_url=config.llm_base_url,
-    model=config.llm_model,
+    api_key=config.llm_api_key,        # 来自 ANTHROPIC_AUTH_TOKEN
+    base_url=config.llm_base_url,      # 来自 ANTHROPIC_BASE_URL
+    model=config.llm_model,            # 来自 ANTHROPIC_MODEL
+    small_fast_model=config.llm_small_fast_model,  # 来自 ANTHROPIC_SMALL_FAST_MODEL
+    custom_model_option=config.llm_custom_model_option,  # 来自 ANTHROPIC_CUSTOM_MODEL_OPTION
+    timeout=config.llm_timeout,        # 来自 API_TIMEOUT_MS (已转换为秒)
 )
 client = LLMClient(provider, config)
 

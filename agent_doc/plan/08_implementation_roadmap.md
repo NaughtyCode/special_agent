@@ -148,7 +148,7 @@ Phase 6 (文档与发布) ← 全 Phase ───────┘
 - LLMProvider 接口解耦具体实现
 - 默认 OpenAICompatProvider 适配所有兼容服务
 - 通过环境变量切换后端, 无需修改代码
-- 兼容旧的 DEEPSEEK_* 环境变量 (平滑迁移)
+- 通过 ANTHROPIC_* 环境变量配置 LLM 后端 (ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL / ANTHROPIC_MODEL 等)
 
 ### 3.6 可扩展性设计
 - 策略模式: Tool 匹配策略、上下文压缩策略均可注入

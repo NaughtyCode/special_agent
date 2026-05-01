@@ -178,7 +178,7 @@ CrewLeader (任意特化 Agent)
 ```
 RootAgent ──→ BaseAgent ──→ ReActEngine ──→ LLMClient ──→ LLMProvider (接口)
                 │                │                │
-                ├─→ ToolManager  │                └─→ Config (llm_* 配置)
+                ├─→ ToolManager  │                └─→ Config (ANTHROPIC_* 环境变量)
                 ├─→ ContextStore │
                 ├─→ AgentRegistry│
                 ├─→ AgentPool    │
