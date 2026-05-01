@@ -753,7 +753,7 @@ class CrewOrchestrator:
            而 plan_temperature 追求的是分解的结构稳定性
         4. 计算 total_duration_ms (sum of all member durations) 和
            total token_usage (sum of all member token_usage)
-        5. 从 results 中提取 task_id 列表构建 execution_order,
+        5. 从 results 每个 tuple 中提取 task_id (第二个元素) 构建 execution_order,
            顺序与执行方法返回的 results 顺序一致
            (SEQUENTIAL: members 列表顺序; PARALLEL: 提交顺序;
             DAG: 拓扑完成顺序)
