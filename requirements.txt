@@ -1,0 +1,15 @@
+# 核心依赖
+httpx>=0.27.0                # 异步 HTTP 客户端 (LLM API 调用)
+pydantic>=2.0.0              # 数据模型与类型校验
+pydantic-settings>=2.0.0     # 环境变量配置加载
+
+# 可选依赖
+tiktoken>=0.5.0              # Token 计数 (精确估算, 若不可用则回退启发式)
+sentence-transformers>=2.0.0 # 语义匹配 (可选, 未安装时回退 TF-IDF)
+rich>=13.0.0                 # 终端富文本输出 (REPL 彩色显示)
+readchar>=4.0.0              # 跨平台单字符读取 (REPL 交互)
+
+# 测试依赖
+pytest>=8.0.0                # 测试框架
+pytest-asyncio>=0.23.0       # 异步测试支持
+pytest-cov>=5.0.0            # 测试覆盖率
