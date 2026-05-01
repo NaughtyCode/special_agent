@@ -144,30 +144,33 @@ CrewLeader (任意特化 Agent)
    ├─ 1. LLM 在 ReAct 循环中判断: 当前任务需多 Agent 协同
    │     (任务复杂度高 / 涉及多个领域 / 需要并行加速)
    │
-   ├─ 2. PLAN: 调用 form_crew(mission)
-   │     └─ CrewOrchestrator.plan_crew()
-   │           ├─ LLM 分解 mission → [SubTask₁, SubTask₂, ..., SubTaskₙ]
-   │           ├─ 每个 SubTask 通过 AgentRegistry.match_agent() 匹配对应 Agent
-   │           ├─ 组建 AgentCrew (含 N 个 CrewMember, 设置 created_at)
-   │           └─ 发布 CrewLifecycleEvent.PLANNED
-   │
-   ├─ 3. EXECUTE: 调用 launch_crew(mission, strategy)
-   │     └─ CrewOrchestrator.execute_crew(crew, strategy)
-   │           ├─ SEQUENTIAL: [CodeAgent] → [DocAgent] → [ShellAgent]
-   │           ├─ PARALLEL:   [CodeAgent | DocAgent | SearchAgent] (并发)
-   │           └─ DAG:        [SearchAgent] ──→ [CodeAgent] ──→ [ShellAgent]
-   │                                    └──→ [DocAgent]
-   │           每个成员执行: AgentPool.acquire → agent.run(task) → AgentPool.release
-   │           发布 CrewLifecycleEvent.MEMBER_STARTED / MEMBER_COMPLETED / MEMBER_FAILED
-   │
-   ├─ 4. AGGREGATE: 汇总所有成员结果
-   │     └─ CrewOrchestrator._aggregate_results()
-   │           ├─ 拼接所有 member.final_answer
-   │           ├─ LLM 生成统一的 mission_summary
-   │           └─ 计算 total token_usage 和 total_duration_ms
+   ├─ 2. 调用 launch_crew(mission, strategy) — 一站式 Crew 编排入口
+   │     │
+   │     ├─ 2a. PLAN: form_crew(mission)
+   │     │     └─ CrewOrchestrator.plan_crew()
+   │     │           ├─ LLM 分解 mission → [SubTask₁, SubTask₂, ..., SubTaskₙ]
+   │     │           ├─ 每个 SubTask 通过 AgentRegistry.match_agent() 匹配对应 Agent
+   │     │           ├─ 组建 AgentCrew (含 N 个 CrewMember, 设置 created_at)
+   │     │           └─ 发布 CrewLifecycleEvent.PLANNED
+   │     │
+   │     ├─ 2b. EXECUTE: CrewOrchestrator.execute_crew(crew, strategy)
+   │     │     ├─ 校验 crew.status == ASSEMBLED → 设置 RUNNING
+   │     │     ├─ SEQUENTIAL: [CodeAgent] → [DocAgent] → [ShellAgent]
+   │     │     ├─ PARALLEL:   [CodeAgent | DocAgent | SearchAgent] (并发)
+   │     │     └─ DAG:        [SearchAgent] ──→ [CodeAgent] ──→ [ShellAgent]
+   │     │                              └──→ [DocAgent]
+   │     │     每个成员: AgentPool.acquire → agent.run(task) → AgentPool.release
+   │     │     发布 MEMBER_STARTED / MEMBER_COMPLETED / MEMBER_FAILED
+   │     │
+   │     ├─ 2c. AGGREGATE: _aggregate_results()
+   │     │     ├─ 拆分成功/失败成员 (含 task_id)
+   │     │     ├─ LLM 生成统一的 mission_summary
+   │     │     └─ 计算 token_usage + duration_ms, 构建 execution_order
+   │     │
+   │     └─ 2d. 将 mission_summary 写入 ContextStore
    │
    ▼
-CrewLeader 将 CrewResult.mission_summary 作为 Observation 继续 ReAct 推理
+返回 CrewResult, CrewLeader 将 mission_summary 作为 Observation 继续 ReAct 推理
 ```
 
 ## 5. 模块依赖关系

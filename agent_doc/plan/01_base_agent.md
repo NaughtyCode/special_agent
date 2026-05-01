@@ -191,6 +191,10 @@ class BaseAgent(ABC):
         """
         组建并执行一个 Agent 团队完成复杂使命 (form_crew + execute_crew)。
 
+        参数解析顺序 (优先级从高到低):
+        - strategy: self.config.crew_strategy_override → 参数 strategy → ExecutionStrategy.SEQUENTIAL
+        - max_parallel: self.config.crew_max_parallel_override → 参数 max_parallel → Config.crew_max_parallel
+
         流程:
         1. 调用 self.form_crew(mission) 组建团队
         2. 调用 crew_orchestrator.execute_crew(crew, strategy, max_parallel)

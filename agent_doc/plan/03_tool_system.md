@@ -530,6 +530,7 @@ class CrewPlanError(Exception):
     典型场景:
     - LLM 返回的 JSON 格式错误, 且已耗尽 crew_max_iterations 次重试
     - LLM 返回的 SubTask 列表为空 (mission 无法分解)
+    - SubTask.dependencies 中存在循环依赖 (DAG 无法拓扑排序)
     - LLM 调用超时或返回不可恢复错误
 
     携带 raw_llm_output 属性供调试, 包含 LLM 最后一次原始输出。
@@ -628,24 +629,31 @@ class CrewOrchestrator:
         1. 校验 crew.status == "ASSEMBLED", 不满足则抛出 CrewInvalidStateError
         2. 设置 crew.status = "RUNNING"
         3. 发布 CrewLifecycleEvent.STARTED (携带 CrewEvent 负载, 含 crew_id 和 strategy)
-        4. 根据 strategy 分发到 _execute_sequential / _execute_parallel / _execute_dag
-        5. 每个成员执行: AgentPool.acquire → agent.run(task) → AgentPool.release
+        4. 根据 strategy 分发:
+           - SEQUENTIAL → _execute_sequential(crew)
+           - PARALLEL   → _execute_parallel(crew, max_parallel or self.max_parallel)
+             (max_parallel 为 None 时回退到 self.max_parallel, 即 Config.crew_max_parallel)
+           - DAG        → _execute_dag(crew)
+        5. 在各执行方法内部, 每个成员执行: AgentPool.acquire → agent.run(task) → AgentPool.release
            每个成员必须使用 try/finally 确保 AgentPool.release 在异常时也被调用,
            避免 AgentPool 实例泄漏:
            ```
            member.agent_instance = agent_pool.acquire(member.agent_name, ...)
            try:
                member.status = "RUNNING"
+               member.started_at = time.time()
                member.result = agent.run(task.description, task.context)
                member.status = "DONE"
            except Exception as e:
                member.status = "FAILED"
                member.result = AgentResult(success=False, final_answer=str(e), ...)
            finally:
+               member.completed_at = time.time()
                agent_pool.release(member.agent_instance)
            ```
            (每个成员执行时发布 MEMBER_STARTED / MEMBER_COMPLETED / MEMBER_FAILED,
-            各携带 CrewEvent 负载含 crew_id, member_name, task_id)
+            MEMBER_COMPLETED 携带 duration_ms=completed_at-started_at,
+            MEMBER_FAILED 携带 error_message)
         6. 汇总所有成员结果 → 调用 _aggregate_results
         7. 设置 crew.status = "COMPLETED" (全部成功) 或 "FAILED" (有失败成员)
         8. 发布 CrewLifecycleEvent.COMPLETED 或 FAILED (携带 CrewEvent 负载)
@@ -698,8 +706,11 @@ class CrewOrchestrator:
         使用 concurrent.futures.ThreadPoolExecutor 实现并发控制。
         适用于成员间无依赖的独立子任务 (如同时搜索多个信息源)。
 
-        返回结果按提交顺序排列, 与 members 列表顺序一致。
-        返回的 list 顺序即 execution_order (task_id 列表)。
+        若某成员失败, 不影响其他成员的执行 (任务间无依赖),
+        失败信息记录在 member.result 中, 由 _aggregate_results 统一收集到 failed_members。
+
+        返回结果按提交顺序排列 (通过遍历 futures 列表而非 as_completed 收集),
+        与 members 列表顺序一致。返回的 list 顺序即 execution_order (task_id 列表)。
         """
 
     def _execute_dag(self, crew: AgentCrew) -> list[tuple[str, str, AgentResult]]:
@@ -713,15 +724,18 @@ class CrewOrchestrator:
 
         算法:
         1. 构建依赖图 (SubTask.dependencies → task_id → 被哪些 task 依赖)
-        2. 找出所有入度为 0 的成员, 加入就绪队列
-        3. 并发执行就绪队列中的所有成员
-        4. 每完成一个成员, 将其结果传递给所有依赖它的后续成员:
+        2. 检测循环依赖: 若依赖图中存在环 (拓扑排序无法找到入度为 0 的节点),
+           抛出 CrewPlanError("circular dependency detected in DAG"),
+           因为含环的 DAG 无法确定执行起点
+        3. 找出所有入度为 0 的成员, 加入就绪队列
+        4. 并发执行就绪队列中的所有成员
+        5. 每完成一个成员, 将其结果传递给所有依赖它的后续成员:
            context 合并策略 — 保留原有 task.context 的键,
            新增 "dependency_results" 键 (dict[task_id, final_answer]),
            记录所有已完成的依赖任务结果, 供后续成员参考上游输出。
            若键冲突则以新增键为准, 确保上游结果不会被静默丢弃。
-        5. 当某成员的所有依赖都已满足 (全部完成), 将其加入就绪队列
-        6. 重复步骤 3-5 直到所有成员完成
+        6. 当某成员的所有依赖都已满足 (全部完成), 将其加入就绪队列
+        7. 重复步骤 4-6 直到所有成员完成
 
         若某成员失败, 依赖它的后续成员仍会执行:
         失败信息通过 context["dependency_errors"] 传递 (dict[task_id, error_message]),
@@ -812,7 +826,7 @@ class CrewEvent:
     duration_ms: float = 0.0                 # 耗时 (MEMBER_COMPLETED, COMPLETED)
     token_usage: TokenUsage | None = None    # Token 用量 (COMPLETED)
     error_message: str | None = None         # 错误信息 (MEMBER_FAILED, FAILED)
-    partial_results: list | None = None      # 部分成功结果 (FAILED)
+    partial_results: list[tuple[str, str, AgentResult]] | None = None  # 部分成功结果 (FAILED 事件携带, 同 member_results 格式)
 ```
 
 ### 9.4 Crew 编排流程
@@ -821,29 +835,37 @@ class CrewEvent:
 CrewLeader (任意特化 Agent)
    │
    ├─ 1. 识别到任务需要多 Agent 协同
-   │     (LLM 在 ReAct 循环中判断任务复杂度)
+   │     (LLM 在 ReAct 循环中判断任务复杂度,
+   │      通过已注册的 CrewTool 调用 launch_crew)
    │
-   ├─ 2. 调用 self.form_crew(mission)
-   │     └─ crew_orchestrator.plan_crew(mission, lead_agent_name, available_agents)
-   │           ├─ LLM 分解 mission → SubTask[]
-   │           ├─ AgentRegistry.match_agent() × N → CrewMember[]
-   │           └─ 返回 AgentCrew (status=ASSEMBLED)
-   │
-   ├─ 3. 调用 self.launch_crew(mission, strategy)
-   │     └─ crew_orchestrator.execute_crew(crew, strategy)
-   │           ├─ SEQUENTIAL: [CodeAgent] → [DocAgent] → [ShellAgent]
-   │           ├─ PARALLEL:   [CodeAgent | DocAgent | SearchAgent] (并发)
-   │           └─ DAG:        [SearchAgent] → [CodeAgent] → [ShellAgent]
-   │                                  └──────────────→ [DocAgent]
-   │
-   ├─ 4. 写入上下文
-   │     └─ launch_crew() 将 CrewResult.mission_summary 写入 ContextStore
-   │
-   ├─ 5. 聚合结果
-   │     └─ LLM 汇总所有 member.final_answer → mission_summary
+   ├─ 2. 调用 self.launch_crew(mission, strategy)
+   │     │
+   │     ├─ 2a. form_crew(mission)
+   │     │     └─ crew_orchestrator.plan_crew(mission, lead_agent_name, available_agents)
+   │     │           ├─ LLM 分解 mission → SubTask[]
+   │     │           ├─ AgentRegistry.match_agent() × N → CrewMember[]
+   │     │           └─ 返回 AgentCrew (status=ASSEMBLED, created_at 已设置)
+   │     │
+   │     ├─ 2b. crew_orchestrator.execute_crew(crew, strategy)
+   │     │     ├─ 校验 crew.status == ASSEMBLED → 设置 RUNNING
+   │     │     ├─ SEQUENTIAL: [CodeAgent] → [DocAgent] → [ShellAgent]
+   │     │     ├─ PARALLEL:   [CodeAgent | DocAgent | SearchAgent] (并发)
+   │     │     └─ DAG:        [SearchAgent] → [CodeAgent] → [ShellAgent]
+   │     │                            └──────────────→ [DocAgent]
+   │     │     每个成员: acquire → run(task) → release (try/finally)
+   │     │
+   │     ├─ 2c. _aggregate_results()
+   │     │     ├─ 拆分成功/失败成员 (提取 agent_name + task_id)
+   │     │     ├─ LLM 生成 mission_summary
+   │     │     └─ 构建 execution_order + 计算 token/duration
+   │     │
+   │     └─ 2d. 将 CrewResult.mission_summary 写入 ContextStore
    │
    ▼
-CrewLeader 将 CrewResult.mission_summary 作为 Observation 继续 ReAct 推理
+返回 CrewResult, CrewLeader 将 mission_summary 作为 Observation 继续 ReAct 推理
+
+注: 若需要手动审查/调整 Crew 成员, 可跳过 launch_crew(),
+    直接调用 form_crew(mission) → 检查/修改 AgentCrew → execute_crew(crew, strategy)。
 ```
 
 ### 9.5 与现有机制的关系

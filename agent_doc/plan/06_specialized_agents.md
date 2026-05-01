@@ -379,11 +379,13 @@ CodeAgent (CrewLeader)
 #         3. ShellAgent 运行了 12 个测试用例全部通过
 #         4. SearchAgent 提供了 bcrypt 最佳实践参考",
 #     "member_results": [
-#         ("SearchAgent", AgentResult(...)),
-#         ("CodeAgent", AgentResult(...)),
-#         ("DocAgent", AgentResult(...)),
-#         ("ShellAgent", AgentResult(...))
+#         ("SearchAgent", "task_001", AgentResult(...)),
+#         ("CodeAgent",  "task_002", AgentResult(...)),
+#         ("DocAgent",   "task_003", AgentResult(...)),
+#         ("ShellAgent", "task_004", AgentResult(...))
 #     ],
+#     "execution_order": ["task_001", "task_002", "task_003", "task_004"],
+#     "failed_members": [],
 #     "token_usage": TokenUsage(prompt_tokens=8500, completion_tokens=3200, total_tokens=11700)
 # }
 ```

@@ -6,19 +6,25 @@
 |------|------|
 | 修改编号 | issue7 |
 | 修改日期 | 2026-05-01 |
-| 修改类型 | Crew 机制深度审查 (五轮) — 补全缺失定义、修复跨文档不一致、增强注释与错误处理、修复生命周期管理缺失、修复类型不一致与执行细节缺失、修复运行时逻辑错误与资源管理缺陷 |
+| 修改类型 | Crew 机制深度审查 (六轮) — 补全缺失定义、修复跨文档不一致、增强注释与错误处理、修复生命周期管理缺失、修复类型不一致与执行细节缺失、修复运行时逻辑错误与资源管理缺陷、修复类型系统歧义与流程图逻辑错误 |
 | 关联文档 | `agent_doc/plan/` (00, 01, 03, 06, 07, 08) |
 | 修改人 | SpecialArchAgent |
 
 ## 修改概述
 
-对 Issue #6 新增的 Crew 团队编排机制进行五轮反复深度审查。
+对 Issue #6 新增的 Crew 团队编排机制进行六轮反复深度审查。
 
 **第一轮**: 修复缺失的类定义、配置字段缺失、方法参数传递错误、事件定义格式错误、事件发布重复、依赖关系遗漏等问题。
 
 **第二轮**: 修复模块依赖图与路线图遗漏 EventBus、文档节号跳跃与代码示例冲突、编排流程图不一致、Crew 事件负载缺失、异常处理缺失、success 语义模糊等问题，并为所有 Crew 相关数据模型和方法补充详细注释。
 
+**第三轮**: 修复生命周期状态管理缺失 (created_at 未初始化/无状态校验/无状态转换)、全部内置 Agent 缺少 CrewTool 注册、_aggregate_results 缺 failed_members 构建逻辑、form_crew 缺 available_agents 传递等问题。
+
+**第四轮**: 修复类型系统不一致 (list_agents 返回 dict vs AgentMeta)、AgentTool 属性缺失、SubTask→agent.run() 参数映射未文档化、plan_crew JSON 解析失败处理缺失、CrewTool vs AgentTool 选择指南缺失等问题。
+
 **第五轮**: 修复运行时逻辑错误 (strategy 解析未捕获异常)、线程安全文档缺失、execution_order 填充逻辑缺失、资源管理缺陷 (AgentPool acquire/release 无 finally)、AgentConfig Crew 覆写字段缺失、CrewMember 计时字段缺失、空 mission 校验缺失、PARALLEL 策略依赖警告缺失、聚合方法步骤编号重复等问题。
+
+**第六轮**: 修复类型系统歧义 (member_results/failed_members 使用非唯一 agent_name 而非 task_id)、编排流程图逻辑错误 (form_crew + launch_crew 冗余调用)、DAG 循环依赖检测缺失、max_parallel 回退逻辑未文档化、CrewEvent 类型不精确、launch_crew 参数覆写解析顺序缺失等问题。
 
 ## 文件变更清单
 
@@ -693,3 +699,143 @@ CrewOrchestrator 执行时优先读取 AgentConfig 覆写值, 回退到全局 Co
 - **可观测性**: 问题 35 (execution_order) 和问题 39 (CrewMember 计时字段) 使 Crew 执行的追踪和调试成为可能, 为未来的监控/审计功能奠定基础。
 - **配置粒度**: 问题 38 使每个 Agent 可独立调整 Crew 策略和并行度, 与 AgentConfig 现有的模型/温度覆写形成一致的 per-agent 调参体系。
 - **文档完整性**: 问题 40/41/42/43 消除了边界行为的不确定性, 实现者不再需要猜测聚合温度选择、空输入处理或并行策略的依赖行为。
+
+---
+
+## 第六轮深度审查 (补充修复)
+
+在对 Crew 机制进行第六次反复检查后，发现以下额外问题。本轮重点关注类型系统歧义（非唯一标识符）、流程图逻辑错误、以及遗漏的边界条件处理。
+
+### 追加文件变更清单
+
+| 序号 | 文件路径 | 变更说明 |
+|------|----------|----------|
+| F1 | `agent_doc/plan/03_tool_system.md` | CrewResult.member_results 类型从 `list[tuple[str, AgentResult]]` 改为 `list[tuple[str, str, AgentResult]]` 新增 task_id (agent_name 非唯一, 同类型 Agent 结果无法区分); failed_members 类型从 `list[str]` 改为 `list[tuple[str, str]]` (agent_name, task_id); 三种执行方法返回类型同步更新; _aggregate_results 签名和步骤更新; CrewEvent.partial_results 裸 list 类型精确化; execute_crew 补充 max_parallel 回退逻辑文档 + 代码示例补全 started_at/completed_at 设置 + 事件文档补全 duration_ms/error_message; _execute_dag 新增循环依赖检测文档; _execute_parallel 补充失败处理说明和结果收集方式; CrewPlanError 场景新增循环依赖; §9.4 编排流程图重构为 launch_crew 一站式入口 |
+| F2 | `agent_doc/plan/00_architecture_overview.md` | §4.3 Crew 编排流程图重构: form_crew + launch_crew 冗余调用 → launch_crew 一站式入口含内部 PLAN→EXECUTE→AGGREGATE 子步骤 |
+| F3 | `agent_doc/plan/01_base_agent.md` | launch_crew() 新增 AgentConfig 覆写参数解析顺序文档 (crew_strategy_override → 参数 → 默认值) |
+| F4 | `agent_doc/plan/06_specialized_agents.md` | §6 CrewResult 示例更新 member_results 为三元组格式 (agent_name, task_id, AgentResult), 新增 execution_order 和 failed_members 字段 |
+
+### 追加问题详情
+
+#### 问题 44: member_results 使用 agent_name 作为标识符存在歧义
+
+**发现**: `CrewResult.member_results` 类型为 `list[tuple[str, AgentResult]]`, 其中 `str` 为 agent_name。但 Crew 允许同一类型的 Agent 处理多个子任务 (如 CodeAgent 同时负责后端和前端), agent_name 不唯一。
+
+导致的问题:
+- `member_results` 中两个 `("CodeAgent", AgentResult(...))` 无法区分谁对应哪个子任务
+- `failed_members: list[str]` 存储 agent_name, 同样无法定位具体是哪个子任务失败
+- `execution_order: list[str]` 使用 task_id, 但与 member_results 通过隐式位置对应, 脆弱易错
+
+**修复**:
+- `member_results` 改为 `list[tuple[str, str, AgentResult]]` — (agent_name, task_id, AgentResult), task_id 提供唯一标识
+- `failed_members` 改为 `list[tuple[str, str]]` — (agent_name, task_id)
+- 三种执行方法 (`_execute_sequential/parallel/dag`) 返回类型同步更新
+- `_aggregate_results` 步骤 1 和 5 更新为从 tuple 中提取 task_id
+- `CrewEvent.partial_results` 类型从裸 `list` 精确化为 `list[tuple[str, str, AgentResult]]`
+- `06_specialized_agents.md` CrewResult 示例更新格式
+
+#### 问题 45: 编排流程图 form_crew + launch_crew 冗余调用
+
+**发现**: `00_architecture_overview.md` §4.3 和 `03_tool_system.md` §9.4 的编排流程图存在逻辑错误:
+
+```
+├─ 2. 调用 self.form_crew(mission)          ← 创建 AgentCrew
+│     └─ plan_crew() → AgentCrew
+│
+├─ 3. 调用 self.launch_crew(mission, strategy)  ← 内部再次调用 form_crew()!
+│     └─ execute_crew(crew, strategy)
+```
+
+`launch_crew()` 内部已调用 `form_crew()` (见 `01_base_agent.md` 步骤 1), 因此步骤 3 会创建第二个 AgentCrew, 步骤 2 的产物被丢弃。正确流程应展示 launch_crew 作为一站式入口, 内部依次完成 Plan → Execute → Aggregate。
+
+**修复**: 两个文件的流程图均重构为:
+```
+├─ 2. 调用 launch_crew(mission, strategy)
+│     ├─ 2a. PLAN: form_crew → plan_crew → AgentCrew
+│     ├─ 2b. EXECUTE: execute_crew → 按策略执行
+│     ├─ 2c. AGGREGATE: _aggregate_results
+│     └─ 2d. 写入 ContextStore
+```
+并在 `03_tool_system.md` 末尾补充手动两步骤替代方案说明 (form_crew → 检查 → execute_crew)。
+
+#### 问题 46: DAG 执行缺少循环依赖检测
+
+**发现**: `_execute_dag` 算法步骤 2 为 "找出所有入度为 0 的成员", 但未考虑依赖图中存在环的情况。若 plan_crew 阶段因 LLM 输出错误导致 SubTask A 依赖 B 且 B 依赖 A, 拓扑排序将找不到入度为 0 的节点, 进入静默死锁或抛出索引越界错误。
+
+**修复**:
+- `_execute_dag` 新增步骤 2: "检测循环依赖: 若依赖图中存在环, 抛出 CrewPlanError('circular dependency detected in DAG')"
+- `CrewPlanError` 文档典型场景新增 "SubTask.dependencies 中存在循环依赖"
+- 后续步骤编号调整 (原 2→3, 3→4, ... 6→7)
+
+#### 问题 47: execute_crew 中 max_parallel=None 回退逻辑未文档化
+
+**发现**: `execute_crew()` 接受 `max_parallel: int | None = None`, 但 `_execute_parallel()` 要求 `max_parallel: int` (非可选)。当 LLM 调用 CrewTool 未提供 max_parallel 参数时, `None` 如何转换为有效 int 值未文档化, 实现者需自行推断回退逻辑。
+
+**修复**: `execute_crew()` 步骤 4 补充 PARALLEL 分发逻辑:
+```python
+_execute_parallel(crew, max_parallel or self.max_parallel)
+```
+明确 `None` 时回退到 `self.max_parallel` (即 `Config.crew_max_parallel`, 默认 4)。
+
+#### 问题 48: launch_crew 参数覆写解析顺序缺失
+
+**发现**: `AgentConfig` 新增了 `crew_strategy_override` 和 `crew_max_parallel_override`, 但 `BaseAgent.launch_crew()` 未说明这三个来源 (AgentConfig 覆写、方法参数、全局 Config) 的优先级关系。
+
+**修复**: `launch_crew()` 新增参数解析顺序文档:
+- strategy: self.config.crew_strategy_override → 参数 strategy → ExecutionStrategy.SEQUENTIAL
+- max_parallel: self.config.crew_max_parallel_override → 参数 max_parallel → Config.crew_max_parallel
+
+#### 问题 49: execute_crew 代码示例未设置计时字段
+
+**发现**: Round 5 为 `CrewMember` 新增了 `started_at` 和 `completed_at` 字段, 但 `execute_crew()` 步骤 5 的 per-member 执行代码示例中未设置这两个字段, 导致代码示例与数据模型定义不一致。
+
+**修复**: 代码示例补充:
+```python
+member.started_at = time.time()    # 在 status = "RUNNING" 之后
+member.completed_at = time.time()  # 在 finally 块中
+```
+
+#### 问题 50: execute_crew 事件文档未提及 duration_ms 和 error_message
+
+**发现**: `execute_crew()` 步骤 5 的事件发布说明仅列 "各携带 CrewEvent 负载含 crew_id, member_name, task_id", 但 `MEMBER_COMPLETED` 还携带 `duration_ms`, `MEMBER_FAILED` 还携带 `error_message`。
+
+**修复**: 事件说明更新为:
+"MEMBER_COMPLETED 携带 duration_ms=completed_at-started_at, MEMBER_FAILED 携带 error_message"
+
+#### 问题 51: _execute_parallel 缺少失败处理和结果收集方式说明
+
+**发现**: `_execute_parallel` 未说明:
+- 某成员失败时是否影响其他并行成员
+- 结果收集使用 `futures` 列表遍历还是 `as_completed()` (影响返回顺序)
+
+**修复**: 补充失败处理说明 ("某成员失败不影响其他成员, 失败信息由 _aggregate_results 收集") 和结果收集方式 ("通过遍历 futures 列表而非 as_completed 收集, 保持提交顺序")。
+
+### 第六轮问题修复统计
+
+| 类别 | 数量 | 说明 |
+|------|------|------|
+| 类型系统歧义 | 3 | member_results 缺 task_id、failed_members 非唯一、CrewEvent.partial_results 裸 list |
+| 流程图逻辑错误 | 1 | form_crew + launch_crew 冗余调用 (涉及 2 个文件) |
+| 边界条件缺失 | 2 | DAG 循环依赖检测、_execute_parallel 失败处理 |
+| 文档缺口 | 4 | max_parallel 回退、launch_crew 覆写顺序、计时字段、事件字段 |
+| 示例同步 | 1 | 06_specialized_agents.md CrewResult 示例 |
+| **第六轮合计** | **11** | (问题 44 合并 3 个子问题) |
+
+### 六轮累计修复统计
+
+| 轮次 | 问题数 | 主要类型 |
+|------|--------|----------|
+| 第一轮 | 9 | 缺失定义、参数错误、类型错误、重复逻辑、依赖遗漏、拼写 |
+| 第二轮 | 8 | 依赖遗漏、文档结构、跨文档不一致、缺失结构、异常处理、语义不清、注释 |
+| 第三轮 | 11 | 生命周期管理缺失、功能集成缺失、文档冲突、参数传递、依赖遗漏、语义不明 |
+| 第四轮 | 9 | 类型不一致、属性缺失、执行细节缺失、错误处理缺失、示例不完整、选择指南 |
+| 第五轮 | 11 | 运行时逻辑错误、线程安全、资源管理缺陷、配置缺失、数据模型缺失、文档精确性 |
+| 第六轮 | 11 | 类型歧义、流程图逻辑错误、边界条件缺失、文档缺口、示例同步 |
+| **总计** | **59** | |
+
+### 第六轮影响分析
+
+- **类型安全**: 问题 44 的修复是框架正确性的关键 — 在无唯一标识符的情况下, 任何涉及同类型多 Agent 的 Crew 执行都会产生不可区分的结果, 导致调试和审计无法进行。task_id 的引入使每个结果可精确追溯到其子任务。
+- **流程图正确性**: 问题 45 修复了一个会误导所有实现者的根本性错误 — 如果按原流程图实现, form_crew 会被调用两次, 第一次的结果被静默丢弃, 造成资源浪费和潜在的状态不一致。
+- **运行时健壮性**: 问题 46 (循环依赖检测) 防止了 LLM 输出错误导致的静默死锁, 将不可恢复的错误转化为明确的 CrewPlanError 异常。
+- **实现完备性**: 问题 47-51 填补了文档中的最终细节缺口, 确保实现者无需猜测任何边界行为。
